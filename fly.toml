@@ -1,0 +1,29 @@
+# fly.io config for Polymarket Engine 3
+# Region: lhr (London) — Polymarket WS unblocked + low latency to CLOB matching engine.
+# Size: shared-cpu-1x with 256MB RAM is on the free tier.
+# Auto-restart on crash; no scaling, single instance.
+
+app = "polymarket-engine3"
+primary_region = "lhr"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  # Cross-venue + Dutch + complement all enabled by default
+  # Tune via env if needed
+  WS_MAX_EVENTS = "200"
+  DUTCH_MIN_EDGE = "0.03"
+  COMPLEMENT_MIN_EDGE = "0.02"
+  CROSS_VENUE_MIN_EDGE = "0.04"
+  CROSS_VENUE_KALSHI_POLL_SEC = "30"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+# No HTTP services — engine is a background worker, not a web app.
+# Background-only apps stay running on fly.io's free tier.
+
+[deploy]
+  strategy = "immediate"
