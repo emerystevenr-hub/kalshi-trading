@@ -25,59 +25,25 @@ import re
 import signal
 import sys
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from zoneinfo import ZoneInfo
+
+# Single source of truth for the vegas-match contamination filter and the
+# clean realized P&L / W-L numbers shown in the summary row.
+# Session 7 reversed session 5's "inline mirror" decision (HANDOFF_2026-05-10
+# §lessons 49-50): the mirror was correct but two independent filters means
+# future drift is just one careless edit away. Import directly so the dashboard
+# can never disagree with the Monday milestone print.
+from terminal6_milestone_check import (
+    load_t6_closed,
+    _is_contaminated,
+    compute_stats,
+)
 
 DATA_DIR = Path.home() / "Documents" / "terminal6_data"
 LEDGER = Path.home() / "Documents" / "shadow_pnl" / "ledger.jsonl"
 FLAG = Path.home() / "Documents" / "freshness_alarm.flag"
-
-# Mirror of contamination filter from terminal6_milestone_check.py.
-# Kept inline rather than imported so dashboard has zero hard deps on the
-# milestone check module — a future rename of either file won't silently
-# break the dashboard. See HANDOFF_2026-05-10_session5.md §lessons 49-50.
-_CONTAMINATION_WINDOW = timedelta(hours=12)
-_TICKER_MONTHS = {
-    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
-    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
-}
-
-
-def _parse_ticker_dt_utc(event_ticker: str) -> Optional[datetime]:
-    if not event_ticker or not event_ticker.startswith("KXMLBGAME-"):
-        return None
-    rest = event_ticker[len("KXMLBGAME-"):]
-    if len(rest) < 11:
-        return None
-    try:
-        yy = int(rest[0:2]); mmm = rest[2:5].upper()
-        dd = int(rest[5:7]); hh = int(rest[7:9]); mm = int(rest[9:11])
-    except ValueError:
-        return None
-    if mmm not in _TICKER_MONTHS:
-        return None
-    try:
-        local = datetime(2000 + yy, _TICKER_MONTHS[mmm], dd, hh, mm)
-    except ValueError:
-        return None
-    return local.replace(tzinfo=ZoneInfo("America/New_York")).astimezone(timezone.utc)
-
-
-def _is_contaminated_open(open_record: dict) -> bool:
-    """True if this open's matched commence_time is more than 12h from
-    the ticker's encoded date — vegas-match wrong-day binding (session 5)."""
-    meta = open_record.get("signal_metadata") or {}
-    ticker_dt = _parse_ticker_dt_utc(meta.get("event_ticker") or "")
-    commence_str = meta.get("commence_time_utc") or ""
-    if not ticker_dt or not commence_str:
-        return False  # missing metadata — fail-open
-    try:
-        commence_dt = datetime.fromisoformat(commence_str.replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        return False
-    return abs(commence_dt - ticker_dt) > _CONTAMINATION_WINDOW
 
 DELTA_THRESHOLD = 0.03
 
@@ -221,49 +187,27 @@ def load_open_t6() -> List[dict]:
 def sum_t6_realized() -> Tuple[float, int, int, float, int]:
     """Return (clean_total, clean_wins, clean_losses, excluded_total, excluded_n).
 
-    2026-05-10: dashboard now mirrors terminal6_milestone_check.py — the
-    primary realized P&L excludes vegas-match contaminated closes (where
-    the matched commence_time is >12h from the ticker's encoded date).
-    Contaminated total is preserved as the secondary "audit" line so the
-    dashboard never silently drops the historical record.
+    Session 7: sources from terminal6_milestone_check.load_t6_closed +
+    _is_contaminated directly so the dashboard cannot disagree with the
+    Monday milestone print. Was previously an inline mirror (session 5);
+    mirror was numerically correct but maintained two filters in two files —
+    a future edit to one would have silently desynced the dashboard from
+    the gate verdict. Single source of truth wins.
     """
-    if not LEDGER.exists():
+    all_closes = load_t6_closed()
+    if not all_closes:
         return 0.0, 0, 0, 0.0, 0
-    opens: Dict[str, dict] = {}
-    clean_total = 0.0
-    clean_wins = clean_losses = 0
-    excluded_total = 0.0
-    excluded_n = 0
-    try:
-        with open(LEDGER) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    r = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if r.get("engine") != "T6":
-                    continue
-                t = r.get("type"); pid = r.get("position_id")
-                if t == "open" and pid:
-                    opens[pid] = r
-                elif t == "close" and pid and pid in opens:
-                    op = opens[pid]
-                    pnl = float(r.get("realized_pnl_usd") or 0)
-                    if _is_contaminated_open(op):
-                        excluded_total += pnl
-                        excluded_n += 1
-                    else:
-                        clean_total += pnl
-                        if pnl > 0:
-                            clean_wins += 1
-                        elif pnl < 0:
-                            clean_losses += 1
-    except OSError:
-        pass
-    return clean_total, clean_wins, clean_losses, excluded_total, excluded_n
+    clean = [c for c in all_closes if not _is_contaminated(c)]
+    contaminated = [c for c in all_closes if _is_contaminated(c)]
+    clean_stats = compute_stats(clean)
+    excluded_total = sum(float(c.get("realized_pnl_usd") or 0) for c in contaminated)
+    return (
+        clean_stats["total_pnl"],
+        clean_stats["wins"],
+        clean_stats["losses"],
+        excluded_total,
+        len(contaminated),
+    )
 
 
 def color_pnl(v: float) -> str:
@@ -324,9 +268,10 @@ def render() -> None:
                f"games={len(by_event):2d}   vegas={len(vegas):2d}   {'flag=' + RED + 'STALE' + RESET + CYAN if FLAG.exists() else 'flag=ok':12s}  ║{RESET}")
     out.append(f"{BOLD}{CYAN}╚══════════════════════════════════════════════════════════════════════════════════════════╝{RESET}")
 
-    # Summary row — clean view (matches terminal6_milestone_check.py default).
-    # Vegas-match contaminated closes are excluded from realized; surfaced on
-    # the secondary line so the dashboard never silently drops the audit trail.
+    # Summary row — clean view sourced from terminal6_milestone_check
+    # (session 7 single-source-of-truth refactor). Vegas-match contaminated
+    # closes are excluded from realized and surfaced on the secondary line so
+    # the dashboard never silently drops the audit trail.
     out.append(f"{BOLD}T6 P&L:{RESET}  realized={color_pnl(realized)}  closed={n_closed} ({wins}W/{losses}L)  "
                f"open={len(open_positions)}  threshold=±{DELTA_THRESHOLD:.2f}pp  "
                f"{DIM}(dry-run until clean n≥300 with edge-confirmed){RESET}")

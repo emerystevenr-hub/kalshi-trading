@@ -1,571 +1,676 @@
-"""Shadow P&L Dashboard — live terminal scoreboard.
+"""Shadow P&L Dashboard — fixed-layout terminal scoreboard (session 7 rewrite).
 
-Run in a terminal, refreshes every N seconds (default 30). Shows:
-  - Portfolio total: starting capital, realized P&L, unrealized, current balance
-  - Per-engine breakdown with W/L count and current balance
-  - Open positions MARKED-TO-MARKET against live Kalshi orderbooks
-  - Active scanner state: T3a scanner alerts, weather logger snaps,
-    HRRR backfill progress, thesis factory latest run + candidate count
+Single 80x24 screen. Refreshes in place every 30 seconds (configurable).
+No scrolling, ever. Archived engines (T1, T2, T4, T5) never appear.
+
+Layout:
+  HEADER     portfolio total clean realized | macro cap % | Odds API | UTC
+  ENGINES    T3a | T3b | T3c | T6 | T7 — one line each
+             columns: mode | clean realized | W/L | open | last fire | gate
+  ALERTS     daemon down, 401s, cap breach, freshness alarm, entropy event
+             Empty box collapses to a single green "NO ALERTS" line.
+  FOOTER     last refresh | next refresh in Xs
+
+T6 P&L, W/L, and gate are sourced from terminal6_milestone_check (clean
+numbers only — never raw ledger). T3a's "PAUSED until <date>" line is
+driven by the presence of ~/Documents/t3a_disabled_until.flag (auto-cleared
+by the Cowork scheduled task t3a-fed-scanner-relaunch-jun10 on 2026-06-10).
 
 Usage:
-    python3 ~/Documents/shadow_dashboard.py
-    python3 ~/Documents/shadow_dashboard.py --refresh-sec 10   # faster tick
-
-Exit: Ctrl+C
+    python3 ~/Documents/shadow_dashboard.py                # 30s refresh
+    python3 ~/Documents/shadow_dashboard.py --refresh-sec 10
+    python3 ~/Documents/shadow_dashboard.py --once         # dump JSON, no curses
+    python3 ~/Documents/shadow_dashboard.py --plain        # no-curses fallback
 
 Reads (never writes):
   ~/Documents/shadow_pnl/engines.json
   ~/Documents/shadow_pnl/ledger.jsonl
-  ~/Documents/terminal3a_data/fed_scanner*
-  ~/Documents/terminal1_logger.log
-  ~/Documents/terminal1_backfill_{gfs,hrrr,ecmwf_hres,aifs}.log
-  ~/Documents/thesis_candidates_latest.json  (if exists)
+  ~/Documents/scheduler_status.json
+  ~/Documents/scheduler.pid
+  ~/Documents/freshness_alarm.flag
+  ~/Documents/macro_cap_alarm.flag
+  ~/Documents/t3a_disabled_until.flag
+  ~/Documents/entropy_alerts.jsonl
+  ~/Documents/scheduler_logs/t6_mlb_lines_puller.log
+  ~/Documents/terminal{3a,3b,6,7}_data/*.log
+
+Imports:
+  terminal6_milestone_check  (clean T6 P&L + gate — single source of truth)
 """
 
+from __future__ import annotations
+
 import argparse
+import curses
 import json
 import os
 import re
-import signal
 import sys
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
-from zoneinfo import ZoneInfo
+from typing import Dict, List, Optional, Tuple
 
-import requests
+# Single source of truth for clean T6 numbers + gate verdict. See
+# terminal6_dashboard.py session-7 refactor commentary for the rationale.
+from terminal6_milestone_check import (
+    load_t6_closed,
+    _is_contaminated,
+    compute_stats,
+    evaluate_gate,
+)
 
+DOCS = Path.home() / "Documents"
+SHADOW_DIR = DOCS / "shadow_pnl"
+LEDGER = SHADOW_DIR / "ledger.jsonl"
+ENGINES_JSON = SHADOW_DIR / "engines.json"
+SCHED_STATUS = DOCS / "scheduler_status.json"
+SCHED_PID = DOCS / "scheduler.pid"
+FRESHNESS_FLAG = DOCS / "freshness_alarm.flag"
+MACRO_FLAG = DOCS / "macro_cap_alarm.flag"
+T3A_PAUSE_FLAG = DOCS / "t3a_disabled_until.flag"
+ENTROPY_ALERTS = DOCS / "entropy_alerts.jsonl"
+T6_LINES_LOG = DOCS / "scheduler_logs" / "t6_mlb_lines_puller.log"
 
-BASE = "https://api.elections.kalshi.com/trade-api/v2"
-HOME = Path.home()
-SHADOW_DIR = HOME / "Documents" / "shadow_pnl"
-LEDGER_PATH = SHADOW_DIR / "ledger.jsonl"
-ENGINES_PATH = SHADOW_DIR / "engines.json"
-
-# T6 vegas-match contamination filter (mirror of terminal6_milestone_check.py +
-# terminal6_dashboard.py, kept inline to avoid hard imports between dashboards).
-# Scoped to engine=T6 only — other engines unaffected. See HANDOFF_2026-05-10_session5.md.
-_T6_CONTAMINATION_WINDOW = timedelta(hours=12)
-_T6_TICKER_MONTHS = {
-    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
-    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+# Per-engine logger paths (used for "last fire" + daemon-down detection).
+# Loggers tick every 5 min; >15 min stale triggers a daemon-down alert.
+# Session 7 final: T3b + T3c archived. T3a daemon killed but bankroll placeholder
+# retained as the sole macro engine. ENGINE_LOGS keeps T3a's path so the "paused"
+# status line still resolves; the daemon-down alert is suppressed via the pause flag.
+ENGINE_LOGS = {
+    "T3a": DOCS / "terminal3a_data" / "fed_scanner.log",
+    "T6":  DOCS / "terminal6_data"  / "kalshi_logger.log",
+    "T7":  DOCS / "terminal7_data"  / "kalshi_logger.log",
 }
 
+# Engines that ALWAYS render (in order). T1/T2/T3b/T3c/T4/T5 never appear.
+# Session 7 archived T3b + T3c with bankroll reallocated to T6 ($13K → $18K).
+ACTIVE_ENGINE_ORDER = ["T3a", "T6", "T7"]
 
-def _t6_parse_ticker_dt_utc(event_ticker: str) -> Optional[datetime]:
-    if not event_ticker or not event_ticker.startswith("KXMLBGAME-"):
-        return None
-    rest = event_ticker[len("KXMLBGAME-"):]
-    if len(rest) < 11:
-        return None
-    try:
-        yy = int(rest[0:2]); mmm = rest[2:5].upper()
-        dd = int(rest[5:7]); hh = int(rest[7:9]); mm = int(rest[9:11])
-    except ValueError:
-        return None
-    if mmm not in _T6_TICKER_MONTHS:
-        return None
-    try:
-        local = datetime(2000 + yy, _T6_TICKER_MONTHS[mmm], dd, hh, mm)
-    except ValueError:
-        return None
-    return local.replace(tzinfo=ZoneInfo("America/New_York")).astimezone(timezone.utc)
+DAEMON_STALE_SEC = 15 * 60   # logger silent > 15m = daemon down
+ENTROPY_RECENT_SEC = 60 * 60  # entropy event from last hour = alert
+ODDS_API_LOW_CREDITS = 50    # < 50 remaining = alert
 
 
-def _is_t6_contaminated_open(open_record: dict) -> bool:
-    """True if a T6 open was bound to a Vegas line whose commence_time is
-    more than 12h from the ticker's encoded date (the vegas-match
-    wrong-day binding bug, fixed in trader 2026-05-10)."""
-    if open_record.get("engine") != "T6":
-        return False
-    meta = open_record.get("signal_metadata") or {}
-    ticker_dt = _t6_parse_ticker_dt_utc(meta.get("event_ticker") or "")
-    commence_str = meta.get("commence_time_utc") or ""
-    if not ticker_dt or not commence_str:
-        return False
-    try:
-        commence_dt = datetime.fromisoformat(commence_str.replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        return False
-    return abs(commence_dt - ticker_dt) > _T6_CONTAMINATION_WINDOW
+# ─────────────────────────────────────────────────────────────────────
+# Helpers (pure — no curses, no I/O side-effects)
+# ─────────────────────────────────────────────────────────────────────
 
-T3A_DATA = HOME / "Documents" / "terminal3a_data"
-T3A_LOG = T3A_DATA / "fed_scanner.log"
-T3A_ALERTS = T3A_DATA / "fed_scanner_alerts.jsonl"
-
-WEATHER_LOG = HOME / "Documents" / "terminal1_logger.log"
-HRRR_LOG = HOME / "Documents" / "terminal1_backfill_hrrr.log"
-GFS_LOG = HOME / "Documents" / "terminal1_backfill_gfs.log"
-AIFS_LOG = HOME / "Documents" / "terminal1_backfill_aifs.log"
-ECMWF_LOG = HOME / "Documents" / "terminal1_backfill_ecmwf_hres.log"
-
-THESIS_DIR = HOME / "Documents"
-
-# ANSI escape codes
-ESC = "\x1b["
-CLEAR = f"{ESC}2J{ESC}H"      # clear screen, home
-HOME_CUR = f"{ESC}H"
-BOLD = f"{ESC}1m"
-DIM = f"{ESC}2m"
-RESET = f"{ESC}0m"
-GREEN = f"{ESC}32m"
-RED = f"{ESC}31m"
-YELLOW = f"{ESC}33m"
-CYAN = f"{ESC}36m"
-BLUE = f"{ESC}34m"
-
-_STOP = False
-
-
-def _handle_sigint(sig, frame):
-    global _STOP
-    _STOP = True
-
-
-def _color_pnl(v: float, width: int = 10) -> str:
-    s = f"{v:+.2f}"
-    pad = " " * max(0, width - len(s) - 1)
-    if v > 0:
-        return f"{pad}{GREEN}${s}{RESET}"
-    if v < 0:
-        return f"{pad}{RED}${s}{RESET}"
-    return f"{pad}${s}"
-
-
-def _read_ledger() -> List[dict]:
-    if not LEDGER_PATH.exists():
+def _read_jsonl(path: Path) -> List[dict]:
+    if not path.exists():
         return []
-    rows = []
+    out = []
     try:
-        with open(LEDGER_PATH) as f:
+        with open(path) as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 try:
-                    rows.append(json.loads(line))
+                    out.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
     except OSError:
         pass
-    return rows
+    return out
 
 
-def _read_engines() -> Dict[str, dict]:
+def _read_json(path: Path) -> dict:
     try:
-        return json.loads(ENGINES_PATH.read_text())
+        return json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         return {}
 
 
-def fetch_live_price(ticker: str, timeout: float = 3.0) -> Optional[Dict[str, float]]:
-    """Return current {yes_bid, yes_ask, mid} for a Kalshi ticker, or None."""
+def _file_mtime(path: Path) -> Optional[float]:
     try:
-        r = requests.get(
-            f"{BASE}/markets/{ticker}/orderbook", timeout=timeout
-        )
-    except requests.RequestException:
+        return path.stat().st_mtime
+    except (OSError, FileNotFoundError):
         return None
-    if r.status_code != 200:
-        return None
-    body = r.json()
-    ob = body.get("orderbook_fp") or body.get("orderbook") or {}
-    yes_levels = ob.get("yes_dollars") or ob.get("yes") or []
-    no_levels = ob.get("no_dollars") or ob.get("no") or []
-
-    def best(levels):
-        best_p = 0.0
-        for lvl in levels:
-            try:
-                p = float(lvl[0])
-                if p < 2:
-                    pc = round(p * 100)
-                else:
-                    pc = round(p)
-                if pc > best_p:
-                    best_p = pc
-            except (ValueError, IndexError, TypeError):
-                continue
-        return best_p
-
-    yes_bid_c = best(yes_levels)
-    no_bid_c = best(no_levels)
-    yes_ask_c = 100 - no_bid_c if no_bid_c else 0
-    if yes_bid_c and yes_ask_c:
-        mid = (yes_bid_c + yes_ask_c) / 200.0  # dollars
-    elif yes_bid_c:
-        mid = yes_bid_c / 100.0
-    else:
-        mid = 0.0
-    return {
-        "yes_bid": yes_bid_c / 100.0,
-        "yes_ask": yes_ask_c / 100.0 if yes_ask_c else 0.0,
-        "mid": mid,
-    }
 
 
-def compute_portfolio_state(fetch_live: bool = True) -> dict:
-    """Build the full dashboard state."""
-    engines = _read_engines()
-    ledger = _read_ledger()
-
-    state: Dict[str, dict] = {}
-    for eid, meta in engines.items():
-        state[eid] = {
-            "name": meta["name"][:26],
-            "mode": meta.get("mode", "?")[:9],
-            "active": meta.get("active", False),
-            "bankroll_start": meta["bankroll_usd"],
-            "realized_pnl": 0.0,
-            "unrealized_pnl": 0.0,
-            "cost_tied_up": 0.0,
-            "n_open": 0,
-            "n_win": 0,
-            "n_loss": 0,
-            "excluded_realized_pnl": 0.0,
-            "excluded_n": 0,
-            "positions_open": [],
-        }
-
-    # 2026-05-10: pair each close with its open so we can detect T6 vegas-match
-    # contamination (the open record carries the signal_metadata we need).
-    # All-closes loop kept structurally similar to the original but now we
-    # remember the open BEFORE pop, then pass it to the contamination filter.
-    open_map: Dict[str, dict] = {}
-    closes: List[dict] = []
-    close_to_open: Dict[str, dict] = {}
-    for r in ledger:
-        if r["type"] == "open":
-            open_map[r["position_id"]] = r
-        elif r["type"] == "close":
-            pid = r["position_id"]
-            close_to_open[pid] = open_map.get(pid, {})  # may be {} if never opened in this ledger
-            closes.append(r)
-            open_map.pop(pid, None)
-
-    for pid, p in open_map.items():
-        eid = p["engine"]
-        if eid not in state:
-            continue
-        state[eid]["n_open"] += 1
-        state[eid]["cost_tied_up"] += p["cost_usd"] + p.get("fee_usd", 0.0)
-
-        live = None
-        mark = p["price"]  # default: at entry price (no unrealized)
-        if fetch_live and p.get("venue") == "kalshi":
-            live = fetch_live_price(p["ticker"])
-            if live:
-                mark = live["mid"]
-        if p["side"] == "YES":
-            cur_value = mark * p["size"]
-        else:
-            cur_value = (1.0 - mark) * p["size"]
-        unrealized = cur_value - p["cost_usd"] - p.get("fee_usd", 0.0)
-        state[eid]["unrealized_pnl"] += unrealized
-        state[eid]["positions_open"].append({
-            **p,
-            "mark_price": mark,
-            "cur_value": cur_value,
-            "unrealized": unrealized,
-            "live": live,
-        })
-
-    for c in closes:
-        eid = c.get("engine")
-        if eid not in state:
-            continue
-        op = close_to_open.get(c["position_id"], {})
-        # Contamination filter is T6-specific (see _is_t6_contaminated_open).
-        # Closes flagged contaminated go into the "excluded" buckets so the
-        # validation gate matches terminal6_milestone_check.py and the
-        # in-engine terminal6_dashboard.py.
-        if _is_t6_contaminated_open(op):
-            state[eid]["excluded_realized_pnl"] += c["realized_pnl_usd"]
-            state[eid]["excluded_n"] += 1
-            continue
-        state[eid]["realized_pnl"] += c["realized_pnl_usd"]
-        if c["outcome"] == "win":
-            state[eid]["n_win"] += 1
-        elif c["outcome"] == "loss":
-            state[eid]["n_loss"] += 1
-
-    for eid, s in state.items():
-        s["realized_pnl"] = round(s["realized_pnl"], 2)
-        s["unrealized_pnl"] = round(s["unrealized_pnl"], 2)
-        s["cost_tied_up"] = round(s["cost_tied_up"], 2)
-        s["excluded_realized_pnl"] = round(s["excluded_realized_pnl"], 2)
-        s["current_balance"] = round(
-            s["bankroll_start"] + s["realized_pnl"]
-            - s["cost_tied_up"] + s["unrealized_pnl"],
-            2,
-        )
-
-    return state
+def _fmt_age(seconds: float) -> str:
+    if seconds < 60:
+        return f"{int(seconds)}s ago"
+    if seconds < 3600:
+        return f"{int(seconds/60)}m ago"
+    if seconds < 86400:
+        return f"{seconds/3600:.1f}h ago"
+    return f"{seconds/86400:.1f}d ago"
 
 
-# -----------------------------------------------------------------------
-# Scanner state lookups (non-fatal on missing files)
-# -----------------------------------------------------------------------
-
-def _tail(path: Path, n: int = 1) -> List[str]:
-    if not path.exists():
-        return []
+def _proc_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
     try:
-        with open(path) as f:
-            lines = f.readlines()
-        return [ln.rstrip() for ln in lines[-n:]]
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
     except OSError:
-        return []
+        return False
+    return True
 
 
-def scanner_state() -> dict:
-    state = {}
+# ─────────────────────────────────────────────────────────────────────
+# Per-engine stats from the shadow_pnl ledger
+# ─────────────────────────────────────────────────────────────────────
 
-    # T3a scanner
-    if T3A_LOG.exists():
-        tail_log = _tail(T3A_LOG, 30)
-        snap_lines = [ln for ln in tail_log if "snap #" in ln]
-        last = snap_lines[-1] if snap_lines else ""
-        m = re.search(r"snap #(\d+).*alerts=(\d+).*in ([\d.]+)s", last)
-        state["t3a"] = {
-            "snap": int(m.group(1)) if m else 0,
-            "alerts_last": int(m.group(2)) if m else 0,
-            "snap_time_s": float(m.group(3)) if m else 0.0,
-            "last_line": last[:110],
-        }
-    else:
-        state["t3a"] = None
-
-    # T3a alerts total
-    if T3A_ALERTS.exists():
-        try:
-            with open(T3A_ALERTS) as f:
-                state["t3a_total_alerts"] = sum(1 for _ in f)
-        except OSError:
-            state["t3a_total_alerts"] = 0
-    else:
-        state["t3a_total_alerts"] = 0
-
-    # Weather logger
-    if WEATHER_LOG.exists():
-        tail_log = _tail(WEATHER_LOG, 20)
-        snap_lines = [ln for ln in tail_log if "snap #" in ln]
-        last = snap_lines[-1] if snap_lines else ""
-        m = re.search(r"snap #(\d+).*total=(\d+)", last)
-        state["weather"] = {
-            "snap": int(m.group(1)) if m else 0,
-            "total": int(m.group(2)) if m else 0,
-            "last_line": last[:110],
-        }
-    else:
-        state["weather"] = None
-
-    # HRRR backfill
-    for name, path in [("hrrr", HRRR_LOG), ("gfs", GFS_LOG),
-                       ("aifs", AIFS_LOG), ("ecmwf_hres", ECMWF_LOG)]:
-        done = False
-        last_cum = 0
-        if path.exists():
-            try:
-                with open(path) as f:
-                    for line in f:
-                        if "BACKFILL COMPLETE" in line:
-                            done = True
-                        m = re.search(r"cumulative: (\d+)", line)
-                        if m:
-                            last_cum = int(m.group(1))
-            except OSError:
-                pass
-        state[name] = {"cumulative": last_cum, "complete": done}
-
-    # Thesis factory latest
-    latest_json = None
-    for path in sorted(THESIS_DIR.glob("thesis_candidates_*.json"), reverse=True):
-        if "latest" in path.name:
+def _engine_ledger_stats(ledger: List[dict], engine: str) -> Tuple[float, int, int, int]:
+    """Return (realized_pnl, wins, losses, open_count) for one engine
+    using raw ledger only. T6 is overridden by milestone_check in the caller."""
+    opens: Dict[str, dict] = {}
+    closed_pids: set = set()
+    pnl = 0.0
+    wins = losses = 0
+    for r in ledger:
+        if r.get("engine") != engine:
             continue
-        latest_json = path
-        break
-    state["thesis_latest"] = {"path": None, "count": 0, "mtime": None}
-    if latest_json:
-        try:
-            data = json.loads(latest_json.read_text())
-            count = len(data.get("candidates", data)) if isinstance(data, (dict, list)) else 0
-            if isinstance(data, list):
-                count = len(data)
-            elif isinstance(data, dict) and "candidates" in data:
-                count = len(data["candidates"])
-            state["thesis_latest"] = {
-                "path": latest_json.name,
-                "count": count,
-                "mtime": datetime.fromtimestamp(
-                    latest_json.stat().st_mtime, tz=timezone.utc
-                ).strftime("%Y-%m-%d %H:%M"),
-            }
-        except (json.JSONDecodeError, OSError, PermissionError):
-            state["thesis_latest"] = {"path": latest_json.name, "count": "?", "mtime": None}
+        t = r.get("type")
+        pid = r.get("position_id")
+        if t == "open" and pid:
+            opens[pid] = r
+        elif t == "close" and pid:
+            closed_pids.add(pid)
+            v = float(r.get("realized_pnl_usd") or 0)
+            pnl += v
+            if v > 0:
+                wins += 1
+            elif v < 0:
+                losses += 1
+    open_count = sum(1 for pid in opens if pid not in closed_pids)
+    return round(pnl, 2), wins, losses, open_count
 
+
+def _t6_clean_stats() -> Tuple[float, int, int, int, dict]:
+    """Clean T6 numbers + gate, sourced from terminal6_milestone_check.
+    Returns (clean_total_pnl, wins, losses, open_count, gate_dict)."""
+    all_closes = load_t6_closed()
+    clean = [c for c in all_closes if not _is_contaminated(c)]
+    stats = compute_stats(clean)
+    gate = evaluate_gate(stats)
+    # Open positions: from ledger — count T6 opens with no matching close.
+    open_pids: Dict[str, bool] = {}
+    closed_pids: set = set()
+    for r in _read_jsonl(LEDGER):
+        if r.get("engine") != "T6":
+            continue
+        pid = r.get("position_id")
+        if not pid:
+            continue
+        if r.get("type") == "open":
+            open_pids[pid] = True
+        elif r.get("type") == "close":
+            closed_pids.add(pid)
+    open_count = sum(1 for pid in open_pids if pid not in closed_pids)
+    return round(stats["total_pnl"], 2), stats["wins"], stats["losses"], open_count, gate
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Macro cap %
+# ─────────────────────────────────────────────────────────────────────
+
+def _macro_cap_pct(engines: dict) -> Optional[float]:
+    """% of TOTAL deployed bankroll allocated to macro-category engines.
+    Returns None if engines.json has no usable bankroll fields."""
+    macro = 0.0
+    total = 0.0
+    for eid, meta in engines.items():
+        if not meta.get("active"):
+            continue
+        bk = float(meta.get("bankroll_usd") or 0)
+        if bk <= 0:
+            continue
+        total += bk
+        if meta.get("category") == "macro":
+            macro += bk
+    if total <= 0:
+        return None
+    return 100.0 * macro / total
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Odds API credits — tail t6 lines puller log for "remaining=N"
+# ─────────────────────────────────────────────────────────────────────
+
+_REMAIN_RE = re.compile(r"remaining=(\d+)")
+
+
+def _odds_api_credits() -> Optional[int]:
+    if not T6_LINES_LOG.exists():
+        return None
+    try:
+        with open(T6_LINES_LOG) as f:
+            # Tail the last ~16KB and scan for the last remaining=N
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 16384))
+            blob = f.read()
+    except OSError:
+        return None
+    last = None
+    for m in _REMAIN_RE.finditer(blob):
+        last = int(m.group(1))
+    return last
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Last-fire per engine
+# ─────────────────────────────────────────────────────────────────────
+
+def _scheduler_last_run(sched_status: dict, job_name: str) -> Optional[float]:
+    for j in sched_status.get("jobs", []):
+        if j.get("name") == job_name:
+            return j.get("last_run_ts")
+    return None
+
+
+def _last_fire_age(engine: str, sched_status: dict) -> Optional[float]:
+    """Seconds since the engine's most recent activity, or None if unknown.
+    Priority: continuous logger mtime > scheduler job last_run_ts."""
+    log = ENGINE_LOGS.get(engine)
+    if log:
+        mt = _file_mtime(log)
+        if mt is not None:
+            return time.time() - mt
+    # Fall back to scheduler job for engines without a continuous logger.
+    job_map = {
+        "T3c": "t3c_claims_data",
+        "T6":  "t6_mlb_lines_puller",  # only used if T6 logger file missing
+    }
+    job = job_map.get(engine)
+    if job:
+        ts = _scheduler_last_run(sched_status, job)
+        if ts:
+            return time.time() - ts
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Alerts
+# ─────────────────────────────────────────────────────────────────────
+
+def _build_alerts(state: dict) -> List[Tuple[str, str]]:
+    """Return list of (severity, message). severity in {'red','yellow'}.
+    Order is fixed-priority: cap > freshness > daemon-down > odds > entropy > scheduler."""
+    alerts: List[Tuple[str, str]] = []
+
+    # Cap breach
+    if MACRO_FLAG.exists():
+        try:
+            msg = MACRO_FLAG.read_text().strip().splitlines()[0]
+        except OSError:
+            msg = "macro cap breached"
+        alerts.append(("red", f"MACRO CAP: {msg[:60]}"))
+
+    # Freshness
+    if FRESHNESS_FLAG.exists():
+        try:
+            msg = FRESHNESS_FLAG.read_text().strip().splitlines()[0]
+        except OSError:
+            msg = "freshness alarm raised"
+        alerts.append(("red", f"FRESHNESS: {msg[:60]}"))
+
+    # Scheduler process down
+    if SCHED_PID.exists():
+        try:
+            pid = int(SCHED_PID.read_text().strip())
+            if not _proc_alive(pid):
+                alerts.append(("red", f"SCHEDULER DOWN: pid {pid} not running"))
+        except (ValueError, OSError):
+            pass
+
+    # Daemon down (logger silent > 15 min). T3a skipped if paused.
+    paused_engines = {"T3a"} if T3A_PAUSE_FLAG.exists() else set()
+    for eng in ACTIVE_ENGINE_ORDER:
+        if eng in paused_engines:
+            continue
+        log = ENGINE_LOGS.get(eng)
+        if not log:
+            continue
+        mt = _file_mtime(log)
+        if mt is None:
+            # Logger file never existed — only alert if engine is active in engines.json
+            if state["engines_meta"].get(eng, {}).get("active"):
+                alerts.append(("yellow", f"{eng} LOGGER: no log file at {log.name}"))
+            continue
+        age = time.time() - mt
+        if age > DAEMON_STALE_SEC:
+            alerts.append(("red", f"{eng} DAEMON DOWN: logger silent {_fmt_age(age)}"))
+
+    # Odds API low credits
+    credits = state.get("odds_api_credits")
+    if credits is not None and credits < ODDS_API_LOW_CREDITS:
+        alerts.append(("red", f"ODDS API: only {credits} credits remaining"))
+
+    # Entropy event in last hour with non-noise level
+    for rec in reversed(_read_jsonl(ENTROPY_ALERTS)[-200:]):
+        if rec.get("alert_level") in (None, "noise"):
+            continue
+        ts_str = rec.get("ts") or ""
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            age = (datetime.now(timezone.utc) - ts).total_seconds()
+        except (TypeError, ValueError):
+            continue
+        if age > ENTROPY_RECENT_SEC:
+            break  # records are time-ordered; older ones irrelevant
+        alerts.append(("yellow", f"ENTROPY: {rec.get('engine')} {rec.get('ticker','?')[:30]} "
+                                 f"z={rec.get('z_score',0):.1f} {_fmt_age(age)}"))
+        break  # only show the most recent
+
+    # Scheduler job non-zero exit
+    for j in state.get("scheduler_status", {}).get("jobs", []):
+        ec = j.get("last_exit_code")
+        if ec is not None and ec != 0:
+            alerts.append(("yellow",
+                           f"SCHEDULER JOB: {j['name']} last exit={ec}"))
+
+    return alerts[:10]  # hard cap so alert box can't grow past the screen
+
+
+# ─────────────────────────────────────────────────────────────────────
+# State assembly
+# ─────────────────────────────────────────────────────────────────────
+
+def gather_state() -> dict:
+    engines_meta = _read_json(ENGINES_JSON)
+    ledger = _read_jsonl(LEDGER)
+    sched = _read_json(SCHED_STATUS)
+    credits = _odds_api_credits()
+    cap_pct = _macro_cap_pct(engines_meta)
+
+    # Per-engine rows
+    per_engine: Dict[str, dict] = {}
+    portfolio_realized = 0.0
+    for eid in ACTIVE_ENGINE_ORDER:
+        meta = engines_meta.get(eid, {})
+        if eid == "T6":
+            pnl, wins, losses, open_count, gate = _t6_clean_stats()
+            gate_str = f"{gate['gate']} n={wins+losses}/300"
+        else:
+            pnl, wins, losses, open_count = _engine_ledger_stats(ledger, eid)
+            gate_str = "active" if meta.get("active") else "idle"
+
+        # Mode override: T3a paused flag wins.
+        if eid == "T3a" and T3A_PAUSE_FLAG.exists():
+            mode = "paused"
+            try:
+                until = T3A_PAUSE_FLAG.read_text().splitlines()[0].strip()
+                # Pretty-print "2026-06-10T16:00:00Z" → "2026-06-10"
+                gate_str = f"PAUSED until {until[:10]}"
+            except OSError:
+                gate_str = "PAUSED"
+        else:
+            mode = meta.get("mode") or ("active" if meta.get("active") else "idle")
+
+        age_sec = _last_fire_age(eid, sched)
+        per_engine[eid] = {
+            "mode": (mode or "?")[:8],
+            "realized": pnl,
+            "wins": wins,
+            "losses": losses,
+            "open": open_count,
+            "last_fire": _fmt_age(age_sec) if age_sec is not None else "—",
+            "last_fire_sec": age_sec,
+            "gate": gate_str[:24],
+        }
+        portfolio_realized += pnl
+
+    state = {
+        "now_utc": datetime.now(timezone.utc),
+        "portfolio_realized": round(portfolio_realized, 2),
+        "macro_cap_pct": cap_pct,
+        "odds_api_credits": credits,
+        "engines_meta": engines_meta,
+        "scheduler_status": sched,
+        "per_engine": per_engine,
+    }
+    state["alerts"] = _build_alerts(state)
     return state
 
 
-# -----------------------------------------------------------------------
-# Rendering
-# -----------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────
+# Curses render
+# ─────────────────────────────────────────────────────────────────────
 
-def render(state_portfolio: dict, state_scanners: dict,
-           refresh_sec: int, last_fetch_dt: float) -> str:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    lines = []
-    lines.append(f"{CLEAR}{BOLD}{CYAN}╔════════════════════════════════════════════════════════════════════════════════════════╗{RESET}")
-    lines.append(f"{BOLD}{CYAN}║  SHADOW P&L DASHBOARD   {now}    refresh={refresh_sec}s   fetch={last_fetch_dt:.1f}s   ║{RESET}")
-    lines.append(f"{BOLD}{CYAN}╠════════════════════════════════════════════════════════════════════════════════════════╣{RESET}")
+# Color pair indexes
+C_DEFAULT = 0
+C_GREEN = 1
+C_RED = 2
+C_YELLOW = 3
+C_CYAN = 4
+C_DIM = 5
 
-    # DEPLOYED portfolio = engines with any activity (open or closed positions).
-    # Everything else is reserved capital, not in play yet.
-    def _has_activity(s):
-        return s["n_open"] + s["n_win"] + s["n_loss"] > 0
 
-    deployed = {k: v for k, v in state_portfolio.items() if _has_activity(v)}
-    reserved = {k: v for k, v in state_portfolio.items() if not _has_activity(v)}
+def _init_colors() -> None:
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(C_GREEN,  curses.COLOR_GREEN,  -1)
+    curses.init_pair(C_RED,    curses.COLOR_RED,    -1)
+    curses.init_pair(C_YELLOW, curses.COLOR_YELLOW, -1)
+    curses.init_pair(C_CYAN,   curses.COLOR_CYAN,   -1)
+    curses.init_pair(C_DIM,    curses.COLOR_WHITE,  -1)
 
-    d_start = sum(s["bankroll_start"] for s in deployed.values())
-    d_real = sum(s["realized_pnl"] for s in deployed.values())
-    d_unreal = sum(s["unrealized_pnl"] for s in deployed.values())
-    d_tied = sum(s["cost_tied_up"] for s in deployed.values())
-    d_current = d_start + d_real - d_tied + d_unreal
-    n_open = sum(s["n_open"] for s in state_portfolio.values())
-    r_start = sum(s["bankroll_start"] for s in reserved.values())
 
-    n_deployed = len(deployed)
-    lines.append(f"{BOLD}  DEPLOYED PORTFOLIO{RESET}  "
-                 f"({n_deployed} engine{'s' if n_deployed != 1 else ''} trading)")
-    lines.append(f"    Start  ${d_start:>10,.0f}      "
-                 f"Realized  {_color_pnl(d_real, 8)}      "
-                 f"Unrealized  {_color_pnl(d_unreal, 8)}")
-    lines.append(f"    Current{_color_pnl(d_current - d_start, 12)}   "
-                 f"→ {BOLD}${d_current:>10,.2f}{RESET}      "
-                 f"Tied-up  ${d_tied:>6,.0f}      "
-                 f"Open={n_open}")
-    if r_start > 0:
-        n_reserved = len(reserved)
-        lines.append(f"    {DIM}Reserved capital (idle engines): ${r_start:,.0f} "
-                     f"across {n_reserved} engine{'s' if n_reserved != 1 else ''}{RESET}")
+def _pnl_attr(v: float) -> int:
+    if v > 0:
+        return curses.color_pair(C_GREEN)
+    if v < 0:
+        return curses.color_pair(C_RED)
+    return curses.A_NORMAL
 
-    lines.append(f"{DIM}  ───────────────────────────────────────────────────────────────────────────────────────{RESET}")
-    lines.append(f"{BOLD}  PER-ENGINE{RESET}")
-    lines.append(f"    {'':<5} {'name':<26} {'mode':<9} "
-                 f"{'start':>7} {'real':>9} {'unreal':>9} {'curr_bal':>10} "
-                 f"{'open':>4} {'W':>2} {'L':>2}")
-    for eid, s in state_portfolio.items():
-        mark = "●" if s["active"] else "○"
-        color = GREEN if s["current_balance"] > s["bankroll_start"] else (
-            RED if s["current_balance"] < s["bankroll_start"] else ""
+
+def _safe_addstr(win, row, col, text, attr=0) -> None:
+    """addstr that silently clips at the right edge instead of raising."""
+    h, w = win.getmaxyx()
+    if row < 0 or row >= h or col < 0 or col >= w:
+        return
+    try:
+        win.addnstr(row, col, text, max(0, w - col - 1), attr)
+    except curses.error:
+        pass
+
+
+def render(stdscr, state: dict, refresh_sec: int, next_in: int) -> None:
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    # Layout assumes 80x24 minimum; gracefully bail if too small.
+    if h < 16 or w < 78:
+        _safe_addstr(stdscr, 0, 0,
+                     f"terminal too small: need ≥80x24, got {w}x{h}",
+                     curses.color_pair(C_RED))
+        stdscr.refresh()
+        return
+
+    # ── HEADER ──────────────────────────────────────────────────────
+    now_s = state["now_utc"].strftime("%Y-%m-%d %H:%M:%S UTC")
+    realized = state["portfolio_realized"]
+    cap = state["macro_cap_pct"]
+    credits = state["odds_api_credits"]
+
+    cap_str = f"{cap:.1f}%" if cap is not None else "?"
+    credits_str = f"{credits}" if credits is not None else "?"
+
+    _safe_addstr(stdscr, 0, 0, " " * (w - 1), curses.A_REVERSE)
+    _safe_addstr(stdscr, 0, 1, " PORTFOLIO ",
+                 curses.A_REVERSE | curses.A_BOLD)
+    _safe_addstr(stdscr, 0, 12, f"realized=", curses.A_REVERSE)
+    _safe_addstr(stdscr, 0, 21, f"${realized:+9.2f}",
+                 curses.A_REVERSE | _pnl_attr(realized))
+    _safe_addstr(stdscr, 0, 32, f"  macro={cap_str:>6}", curses.A_REVERSE)
+    _safe_addstr(stdscr, 0, 48, f"  odds={credits_str:>5}", curses.A_REVERSE)
+    _safe_addstr(stdscr, 0, 62, f"  {now_s}", curses.A_REVERSE)
+
+    # ── ENGINE TABLE ────────────────────────────────────────────────
+    row = 2
+    hdr = f" {'ENG':<4} {'mode':<8} {'clean_real':>11}  {'W/L':>7}  {'open':>4}  {'last_fire':<10}  {'gate':<24}"
+    _safe_addstr(stdscr, row, 0, hdr, curses.A_BOLD | curses.color_pair(C_CYAN))
+    row += 1
+    _safe_addstr(stdscr, row, 0, "─" * (w - 1), curses.color_pair(C_DIM))
+    row += 1
+
+    for eid in ACTIVE_ENGINE_ORDER:
+        e = state["per_engine"][eid]
+        wl = f"{e['wins']}/{e['losses']}"
+        # Build the row in segments so we can color the P&L cell only.
+        _safe_addstr(stdscr, row, 0, f" {eid:<4} {e['mode']:<8} ")
+        _safe_addstr(stdscr, row, 15, f"${e['realized']:>+10.2f}",
+                     _pnl_attr(e['realized']))
+        _safe_addstr(stdscr, row, 27,
+                     f"  {wl:>7}  {e['open']:>4}  "
+                     f"{e['last_fire']:<10}  {e['gate']:<24}")
+
+        # Highlight gate cell for T6 if early-kill or dead
+        if eid == "T6" and ("KILL" in e["gate"] or "DEAD" in e["gate"]):
+            _safe_addstr(stdscr, row, 50, f"{e['gate']:<24}",
+                         curses.color_pair(C_RED) | curses.A_BOLD)
+        elif eid == "T3a" and "PAUSED" in e["gate"]:
+            _safe_addstr(stdscr, row, 50, f"{e['gate']:<24}",
+                         curses.color_pair(C_YELLOW))
+        row += 1
+
+    # ── ALERTS ──────────────────────────────────────────────────────
+    row += 1
+    _safe_addstr(stdscr, row, 0, "─" * (w - 1), curses.color_pair(C_DIM))
+    row += 1
+    _safe_addstr(stdscr, row, 0, " ALERTS",
+                 curses.A_BOLD | curses.color_pair(C_CYAN))
+    row += 1
+
+    alerts = state["alerts"]
+    if not alerts:
+        _safe_addstr(stdscr, row, 1, "✓ NO ALERTS",
+                     curses.color_pair(C_GREEN) | curses.A_BOLD)
+        row += 1
+    else:
+        for sev, msg in alerts:
+            if row >= h - 2:
+                _safe_addstr(stdscr, row, 1,
+                             f"… {len(alerts) - (row - (h-2-len(alerts)))} more (truncated)",
+                             curses.color_pair(C_DIM))
+                row += 1
+                break
+            attr = curses.color_pair(C_RED) if sev == "red" else curses.color_pair(C_YELLOW)
+            _safe_addstr(stdscr, row, 1, f"⚠ {msg}", attr)
+            row += 1
+
+    # ── FOOTER (always last line) ───────────────────────────────────
+    foot_row = h - 1
+    foot = (f" refreshed {state['now_utc'].strftime('%H:%M:%S')} UTC   "
+            f"next in {next_in:>2}s   Ctrl+C to exit")
+    _safe_addstr(stdscr, foot_row, 0, " " * (w - 1),
+                 curses.A_REVERSE | curses.color_pair(C_DIM))
+    _safe_addstr(stdscr, foot_row, 0, foot,
+                 curses.A_REVERSE | curses.color_pair(C_DIM))
+
+    stdscr.refresh()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Plain (no-curses) fallback render — for ssh/CI/log-pipe contexts
+# ─────────────────────────────────────────────────────────────────────
+
+def render_plain(state: dict, refresh_sec: int) -> str:
+    """ANSI-color plain text render, used when curses is unavailable
+    (e.g., output is a pipe). Same layout, but printed each tick instead
+    of in-place redraw."""
+    ESC = "\x1b["
+    GREEN, RED, YELLOW, CYAN, BOLD, DIM, RESET = (
+        f"{ESC}32m", f"{ESC}31m", f"{ESC}33m", f"{ESC}36m",
+        f"{ESC}1m", f"{ESC}2m", f"{ESC}0m",
+    )
+    cap = state["macro_cap_pct"]
+    credits = state["odds_api_credits"]
+    realized = state["portfolio_realized"]
+    pnl_col = GREEN if realized > 0 else (RED if realized < 0 else "")
+    out = []
+    out.append(f"{BOLD}{CYAN}PORTFOLIO{RESET}  "
+               f"realized={pnl_col}${realized:+.2f}{RESET}  "
+               f"macro={(f'{cap:.1f}%' if cap else '?')}  "
+               f"odds={credits if credits is not None else '?'}  "
+               f"{state['now_utc'].strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    out.append(f"{DIM}{'─'*78}{RESET}")
+    out.append(f"{BOLD}{CYAN} ENG  mode      clean_real    W/L      open  last_fire   gate{RESET}")
+    for eid in ACTIVE_ENGINE_ORDER:
+        e = state["per_engine"][eid]
+        pnl_c = GREEN if e["realized"] > 0 else (RED if e["realized"] < 0 else "")
+        gate_c = YELLOW if "PAUSED" in e["gate"] else (
+            RED if ("KILL" in e["gate"] or "DEAD" in e["gate"]) else "")
+        out.append(
+            f" {eid:<4} {e['mode']:<8}  {pnl_c}${e['realized']:>+10.2f}{RESET}  "
+            f"{e['wins']:>2}/{e['losses']:>2}    {e['open']:>4}  "
+            f"{e['last_fire']:<10}  {gate_c}{e['gate']:<24}{RESET}"
         )
-        lines.append(
-            f"    {mark} {eid:<4}{s['name']:<26} {s['mode']:<9} "
-            f"${s['bankroll_start']:>5,.0f}  "
-            f"{_color_pnl(s['realized_pnl'], 8)}  "
-            f"{_color_pnl(s['unrealized_pnl'], 8)}  "
-            f"{color}${s['current_balance']:>8,.2f}{RESET} "
-            f"{s['n_open']:>4} {s['n_win']:>2} {s['n_loss']:>2}"
-        )
-        # Audit secondary line for any engine with contamination-excluded closes.
-        # Currently only T6 (vegas-match wrong-day bug, fixed 2026-05-10).
-        if s.get("excluded_n", 0) > 0:
-            lines.append(
-                f"    {DIM}     └─ excluded (contaminated): "
-                f"{s['excluded_n']} closes  P&L=${s['excluded_realized_pnl']:+.2f}{RESET}"
-            )
-
-    # Open positions
-    lines.append(f"{DIM}  ───────────────────────────────────────────────────────────────────────────────────────{RESET}")
-    open_positions = []
-    for eid, s in state_portfolio.items():
-        for p in s["positions_open"]:
-            open_positions.append((eid, p))
-    lines.append(f"{BOLD}  OPEN POSITIONS ({len(open_positions)}){RESET}")
-    if open_positions:
-        lines.append(f"    {'eng':<4} {'ticker':<38} {'side':<4} {'size':>6} "
-                     f"{'entry':>7} {'mark_side':>9} {'cost':>8} {'unreal':>9}")
-        for eid, p in open_positions[:15]:
-            # Show the mark on YOUR side: for YES position → YES mid; for NO → NO mid
-            your_side_mark = p['mark_price'] if p['side'] == 'YES' else (1.0 - p['mark_price'])
-            lines.append(
-                f"    {eid:<4} {p['ticker'][:38]:<38} {p['side']:<4} "
-                f"{p['size']:>6} ${p['price']:>5.2f}  ${your_side_mark:>5.2f} "
-                f"   ${p['cost_usd']:>6.2f} {_color_pnl(p['unrealized'], 8)}"
-            )
+    out.append(f"{DIM}{'─'*78}{RESET}")
+    out.append(f"{BOLD}{CYAN} ALERTS{RESET}")
+    if not state["alerts"]:
+        out.append(f"  {GREEN}{BOLD}✓ NO ALERTS{RESET}")
     else:
-        lines.append(f"    {DIM}(none){RESET}")
+        for sev, msg in state["alerts"]:
+            col = RED if sev == "red" else YELLOW
+            out.append(f"  {col}⚠ {msg}{RESET}")
+    out.append(f"{DIM} refreshed {state['now_utc'].strftime('%H:%M:%S')} UTC   "
+               f"next in {refresh_sec}s   Ctrl+C to exit{RESET}")
+    return "\n".join(out)
 
-    # Active scanners
-    lines.append(f"{DIM}  ───────────────────────────────────────────────────────────────────────────────────────{RESET}")
-    lines.append(f"{BOLD}  ACTIVE SCANNERS{RESET}")
 
-    t3a = state_scanners.get("t3a")
-    if t3a and t3a["snap"]:
-        lines.append(f"    {BLUE}T3a Fed Scanner{RESET}:   snap #{t3a['snap']}   "
-                     f"alerts_last_snap={t3a['alerts_last']}   "
-                     f"total_alerts={state_scanners['t3a_total_alerts']}")
-    else:
-        lines.append(f"    {DIM}T3a Fed Scanner:   not running / no log yet{RESET}")
+# ─────────────────────────────────────────────────────────────────────
+# Main loop
+# ─────────────────────────────────────────────────────────────────────
 
-    w = state_scanners.get("weather")
-    if w and w["snap"]:
-        lines.append(f"    {BLUE}Weather logger{RESET}:    snap #{w['snap']}   "
-                     f"markets_this_snap={w['total']}")
-    else:
-        lines.append(f"    {DIM}Weather logger:    no log{RESET}")
+def _curses_main(stdscr, refresh_sec: int) -> None:
+    curses.curs_set(0)
+    _init_colors()
+    stdscr.nodelay(True)
+    stdscr.timeout(1000)  # getch returns -1 after 1s
 
-    lines.append(f"    {BLUE}Backfill{RESET}:  ")
-    for m in ("gfs", "hrrr", "ecmwf_hres", "aifs"):
-        meta = state_scanners.get(m, {})
-        status = (f"{GREEN}DONE{RESET}" if meta.get("complete")
-                  else f"{YELLOW}running{RESET}")
-        lines.append(f"       {m:<12} cumulative={meta.get('cumulative', 0):>5}  {status}")
-
-    th = state_scanners.get("thesis_latest", {})
-    if th.get("path"):
-        lines.append(f"    {BLUE}Thesis factory{RESET}:   latest={th['path']}  "
-                     f"candidates={th['count']}  at_utc={th.get('mtime')}")
-    else:
-        lines.append(f"    {DIM}Thesis factory:    no runs yet{RESET}")
-
-    lines.append(f"{BOLD}{CYAN}╚════════════════════════════════════════════════════════════════════════════════════════╝{RESET}")
-    lines.append(f"{DIM}Ctrl+C to exit{RESET}")
-
-    return "\n".join(lines) + "\n"
+    state = gather_state()
+    tick_end = time.time() + refresh_sec
+    while True:
+        remaining = max(0, int(tick_end - time.time()))
+        render(stdscr, state, refresh_sec, remaining)
+        c = stdscr.getch()
+        if c == ord('q') or c == 27:  # q or ESC
+            break
+        if time.time() >= tick_end:
+            state = gather_state()
+            tick_end = time.time() + refresh_sec
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--refresh-sec", type=int, default=30,
-                    help="refresh interval in seconds (default 30)")
-    ap.add_argument("--no-live-prices", action="store_true",
-                    help="skip Kalshi orderbook fetches (use entry prices as mark)")
+    ap.add_argument("--refresh-sec", type=int, default=30)
+    ap.add_argument("--once", action="store_true",
+                    help="dump state as JSON and exit (smoke-test / headless)")
+    ap.add_argument("--plain", action="store_true",
+                    help="no-curses ANSI fallback (for ssh / non-tty)")
     args = ap.parse_args()
 
-    signal.signal(signal.SIGINT, _handle_sigint)
-    signal.signal(signal.SIGTERM, _handle_sigint)
+    if args.once:
+        state = gather_state()
+        # JSON-serializable copy
+        s = dict(state)
+        s["now_utc"] = state["now_utc"].isoformat()
+        s["alerts"] = [{"severity": sev, "message": msg} for sev, msg in state["alerts"]]
+        print(json.dumps(s, indent=2, default=str))
+        return 0
 
-    while not _STOP:
-        t0 = time.time()
+    if args.plain or not sys.stdout.isatty():
         try:
-            portfolio = compute_portfolio_state(fetch_live=not args.no_live_prices)
-            scanners = scanner_state()
-        except Exception as e:
-            portfolio = {}
-            scanners = {"error": str(e)}
-        dt = time.time() - t0
-        sys.stdout.write(render(portfolio, scanners, args.refresh_sec, dt))
-        sys.stdout.flush()
+            while True:
+                state = gather_state()
+                sys.stdout.write("\x1b[2J\x1b[H")  # clear+home
+                sys.stdout.write(render_plain(state, args.refresh_sec) + "\n")
+                sys.stdout.flush()
+                time.sleep(args.refresh_sec)
+        except KeyboardInterrupt:
+            print()
+            return 0
 
-        # Sleep in 1s chunks so Ctrl+C is responsive
-        end = time.time() + args.refresh_sec
-        while time.time() < end and not _STOP:
-            time.sleep(min(1.0, end - time.time()))
-
-    print("\nbye.")
+    try:
+        curses.wrapper(_curses_main, args.refresh_sec)
+    except KeyboardInterrupt:
+        pass
     return 0
 
 

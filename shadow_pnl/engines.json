@@ -11,25 +11,25 @@
     "name": "Kalshi Fed Decisions",
     "bankroll_usd": 5000,
     "active": true,
-    "mode": "shadow",
+    "mode": "paused",
     "category": "macro",
-    "notes": "Scanner running on KXFEDDECISION + KXFED. Dutch-arb + near-miss detection for exclusive series. No opens to date; not wired for trading. Next FOMC June 17-18."
+    "notes": "Scanner KILLED 2026-05-16 (session 7) — no trades ever taken since launch, next FOMC June 17 too far out to justify burning daemon cycles. Bankroll $5K placeholder retained: T3a is now the SOLE macro engine after T3b + T3c archives, anchoring the macro concentration cap at 20% of $25K deployed (well under 50% limit). Manually relaunch the fed_scanner daemon when within ~5 days of FOMC if a Dutch-arb / near-miss opportunity actually materializes. Prior note: scanner ran on KXFEDDECISION + KXFED. Dutch-arb + near-miss detection for exclusive series."
   },
   "T3b": {
     "name": "Kalshi CPI Nowcast",
-    "bankroll_usd": 5000,
-    "active": true,
-    "mode": "shadow",
-    "category": "macro",
-    "notes": "Phase 1 live since 2026-04-26. Cleveland Fed archive accessed via /-/media/files/webcharts/inflationnowcasting/nowcast_year.json — 151 historical target months, 651 (nowcast, actual) pairs. Empirical σ fit per lead bucket (le3=0.107%, 4to7=0.096%, 8to14=0.100%, gt14=0.159%). 2 NO positions open on KXCPIYOY-26APR ($11.28 CB), settles May 13 — auto-reconcile via daemonized hourly reconciler. Entropy gate active 2026-05-09. Spec v0.3 at ~/Documents/terminal3b_cpi_spec.md."
+    "bankroll_usd": 0,
+    "active": false,
+    "mode": "archived",
+    "category": "archived",
+    "notes": "ARCHIVED 2026-05-16 (session 7). $5K reallocated to T6 (T6 $13K → $18K). Session 7 hit a 4-attempt launchd dead-end on com.t3b.kalshi-logger plist — diagnosed conclusively as BTM Label corruption (byte-clone of working reconciler with only Label swapped also exit 78), but the deeper question was whether T3b was earning its operational complexity at all. Lifetime: 0 wins / 3 losses, -$14.01 across paper, no fundamental edge demonstrated against Cleveland Fed nowcast baseline. Decision: kill the engine rather than crack the BTM hairball for a thesis that hadn't proven itself. All T3b daemons killed: terminal3b_kalshi_logger, terminal3b_paper_trader, terminal3b_settlement_reconciler, terminal3b_nowcast_puller. LaunchAgents bootout: com.t3b.settlement-reconciler, com.t3b.bls-actuals, com.t3b.kalshi-logger, com.t3b.kalshi-logger-v2. Prior session notes: Phase 1 live since 2026-04-26."
   },
   "T3c": {
     "name": "Kalshi Surgical GDP/Claims",
-    "bankroll_usd": 5000,
-    "active": true,
-    "mode": "shadow",
-    "category": "macro",
-    "notes": "Active 2026-05-09 (mode upgraded from planning — first print +$4.25 on n=5, 3W/2L). 1 NO position open on KXJOBLESSCLAIMS-26MAY14 ($15.25 CB), settles May 14 — Cowork-side scheduled task t3c-icsa-reconcile-may14 fires 07:30 PT to run reconciler --once. Entropy gate active 2026-05-09. Decision after May 14 settle: scale or hold."
+    "bankroll_usd": 0,
+    "active": false,
+    "mode": "archived",
+    "category": "archived",
+    "notes": "ARCHIVED 2026-05-16 (session 7). $5K reallocated to T6 (T6 $13K → $18K). Lifetime: 3 wins / 5 losses, -$20.75 across paper, n=8 not enough to validate a thesis the macro family wasn't earning anyway. Killed alongside T3b in the macro-family sweep since neither engine had cleared the bar for the operational overhead. Open positions left to expire — do not close early. All T3c daemons killed: terminal3c_kalshi_logger, terminal3c_paper_trader, terminal3c_settlement_reconciler. Scheduler job t3c_claims_data removed from scheduler_jobs.json. Cowork scheduled task t3c-icsa-reconcile-may14 was a one-shot, already fired. Prior session notes: first print +$4.25 on n=5, 3W/2L — turned -$24.97 over next 3 settles."
   },
   "T5": {
     "name": "Catalyst finder",
@@ -56,11 +56,11 @@
   },
   "T6": {
     "name": "Kalshi MLB Game Markets",
-    "bankroll_usd": 13000,
+    "bankroll_usd": 18000,
     "active": true,
     "mode": "shadow",
     "category": "sports",
-    "notes": "Active 2026-05-08. Sharp Vegas (Pinnacle/DK/FD/MGM/Caesars consensus, de-vigged) vs Kalshi KXMLBGAME. WS feed live 2026-05-09. Kelly + fees + floating bankroll + entropy gate active. Bankroll history: $5K initial → $10K (2026-05-09 absorbing T2 archive) → $12K (2026-05-09 absorbing $2K T1 sub-bucket recycle) → $13K (2026-05-16 absorbing $1K T1 full-archive recycle, restores macro cap to 50.0% exact). Kelly cap unchanged at 5% per bet → max single position $650. Total exposure cap 50% → $6.5K. THESIS VALIDATOR for entire sharp-sports vertical (T7, T11/NFL gate on T6 outcome). Validation criterion: n=300 with positive lower-95 CI on after-fee P&L. Early-kill: n=200 with lower-95 < -$0.50. Spec at ~/Documents/terminal6_mlb_spec.md."
+    "notes": "Active 2026-05-08. Sharp Vegas (Pinnacle/DK/FD/MGM/Caesars consensus, de-vigged) vs Kalshi KXMLBGAME. WS feed live 2026-05-09. Kelly + fees + floating bankroll + entropy gate active. Bankroll history: $5K → $10K (2026-05-09 T2 archive) → $12K (2026-05-09 T1 sub-bucket) → $13K (2026-05-16 T1 full-archive) → $18K (2026-05-16 session 7, absorbing $5K T3b archive + $5K T3c archive). Kelly cap unchanged at 5% per bet → max single position $900. Total exposure cap 50% → $9K. Macro family pulled out of the portfolio this session; T6 now carries 72% of deployed capital ($18K of $25K). THESIS VALIDATOR for entire sharp-sports vertical (T7, T11/NFL gate on T6 outcome). Validation criterion: n=300 with positive lower-95 CI on after-fee P&L. Early-kill: n=200 with lower-95 < -$0.50. Spec at ~/Documents/terminal6_mlb_spec.md."
   },
   "T7": {
     "name": "Kalshi NBA/NHL Playoffs (Game 1-2 only",
@@ -68,6 +68,6 @@
     "active": true,
     "mode": "shadow",
     "category": "sports",
-    "notes": "Active 2026-05-10. Spec at terminal7_nba_nhl_spec.md. Bankroll $2K from T1 sub-bucket capital recycle. Adversarial review checkpoint #1 cleared 2026-05-10; C1/H1/H2/H3+H6/H4/H5 fixes landed same session. Game 1-2 only via event-title regex. Per-series cap=2 via synthetic team-pair series_id (Kalshi series_ticker is parent series name, not per-matchup). Liquidity floor OI<100 AND vol_24h<50. Lines puller on existing Odds API free tier shared with T6; SGO Pro $299/mo evaluation pending Pinnacle lead-time backtest during free trial. Deployment moves macro concentration cap from 53.6% to 50.0% exact. Runway-constrained: ~12 G1/G2 games combined NBA+NHL through Finals — architecture-confirmation, not edge validator."
+    "notes": "Active 2026-05-10. Spec at terminal7_nba_nhl_spec.md. Bankroll $2K from T1 sub-bucket capital recycle. Adversarial review checkpoint #1 cleared 2026-05-10; C1/H1/H2/H3+H6/H4/H5 fixes landed same session. Game 1-2 only via event-title regex. Per-series cap=2 via synthetic team-pair series_id (Kalshi series_ticker is parent series name, not per-matchup). Liquidity floor OI<100 AND vol_24h<50. Lines puller on existing Odds API free tier shared with T6; SGO Pro $299/mo evaluation pending Pinnacle lead-time backtest during free trial. Macro cap now T3a-only at 20% of $25K deployed (T3b + T3c archived session 7). Runway-constrained: ~12 G1/G2 games combined NBA+NHL through Finals — architecture-confirmation, not edge validator."
   }
 }
