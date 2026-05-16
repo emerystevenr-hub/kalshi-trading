@@ -1,0 +1,102 @@
+# =============================================================================
+# Kalshi Trading Portfolio — .gitignore
+# =============================================================================
+# Init 2026-05-16 (session 6). Allowlist-style: ~/Documents contains both
+# project files and personal files. This .gitignore excludes everything
+# non-project (personal media, other folders) and all runtime data, logs,
+# secrets. Project source (.py, .sh, .md, .plist, engines.json, infra) is
+# tracked.
+# =============================================================================
+
+# --- Engine runtime data (~19 GB across engines; never committed) ---
+terminal*_data/
+
+# --- Trade ledger (operational state, rewritten each cycle) ---
+shadow_pnl/ledger.jsonl
+shadow_pnl/ledger.jsonl.bak*
+shadow_pnl/calibration_era.json
+
+# --- All logs, stdout/stderr captures, alarm flags ---
+*.log
+*.out
+*.err
+*.flag
+
+# --- Scheduler runtime state (regenerated each tick) ---
+scheduler_logs/
+scheduler_status.json
+scheduler_state.json
+nowcast_puller.out
+nowcast_puller.err
+
+# --- Data file extensions (all are runtime data, not config) ---
+*.jsonl
+*.csv
+
+# --- Top-level cache / data JSONs (not config) ---
+hot_list.json
+hot_tokens.json
+kalshi_candidates_v2.json
+engine1_flow_signals.json
+diag_spread_live.json
+polymarket_events_cache.json
+polymarket_recon_*.json
+thesis_candidates_*.json
+mm_universe*.json
+venue_pairs.json
+terminal1_phase1_report.json
+
+# --- Text dumps / curator outputs ---
+*.txt
+factory_run.log
+
+# --- Python build artifacts ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Backups / temp files ---
+*.bak
+*.bak_*
+*.new
+*.tmp
+*~
+
+# --- OS / editor / IDE ---
+.DS_Store
+.localized
+.vscode/
+.idea/
+*.swp
+
+# --- SECRETS — never commit ---
+.odds_api_key
+.sgo_api_key
+.env
+*.key
+*.pem
+kalshi_private_key*
+*_secret*
+*_credential*
+
+# --- Process state files ---
+*.pid
+scheduler.pid
+
+# --- Non-project folders in ~/Documents ---
+Claude/
+Saflot/
+archive/
+entropy_calibration_reports/
+.claude/
+
+# --- Personal media in ~/Documents ---
+*.pdf
+*.mov
+*.mp4
+*.jpg
+*.jpeg
+*.png
+*.heic
+*.zip

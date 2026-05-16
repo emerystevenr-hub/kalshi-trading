@@ -1,0 +1,5 @@
+# Keep the Docker build context tiny — only ship the engine + test file
+*
+!polymarket_engine3.py
+!polymarket_engine3_test.py
+!Dockerfile
