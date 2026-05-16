@@ -1,0 +1,61 @@
+{
+  "_doc": "Single source of truth for every periodic puller in the portfolio. Edit and SIGHUP the scheduler to reload (kill -HUP $(cat ~/Documents/scheduler.pid)). Per-job stdout/stderr lands in ~/Documents/scheduler_logs/<name>.log.",
+  "jobs": [
+    {
+      "name": "t1_nws_actuals",
+      "command": "/opt/homebrew/bin/python3 ~/Documents/terminal1_nws_actuals.py --backfill-days 3",
+      "interval_sec": 21600,
+      "timeout_sec": 300,
+      "enabled": true,
+      "_notes": "Iowa State ASOS pull, 7 stations. Replaces the broken com.terminal1.nws-actuals LaunchAgent (exit 78 since 2026-05-01) and the bash-loop nohup workaround."
+    },
+    {
+      "name": "t3b_nowcast_puller",
+      "command": "/opt/homebrew/bin/python3 ~/Documents/terminal3b_nowcast_puller.py --once",
+      "interval_sec": 21600,
+      "timeout_sec": 300,
+      "enabled": false,
+      "_notes": "DISABLED until the existing nohup loop (started 2026-05-08 15:44 UTC) is killed. Migrate by: pkill -f terminal3b_nowcast_puller, then set enabled=true and SIGHUP the scheduler."
+    },
+    {
+      "name": "t3b_bls_actuals",
+      "command": "/opt/homebrew/bin/python3 ~/Documents/terminal3b_bls_actuals.py",
+      "interval_sec": 86400,
+      "timeout_sec": 300,
+      "enabled": false,
+      "_notes": "DISABLED until com.t3b.bls-actuals.plist is unloaded. Migrate by: launchctl unload ~/Library/LaunchAgents/com.t3b.bls-actuals.plist, then set enabled=true and SIGHUP."
+    },
+    {
+      "name": "t3c_claims_data",
+      "command": "/opt/homebrew/bin/python3 ~/Documents/terminal3c_claims_data.py",
+      "interval_sec": 43200,
+      "timeout_sec": 300,
+      "enabled": true,
+      "_notes": "Migrated 2026-05-08 from com.terminal3c.claims-data.plist (was exit=1 \u2014 pre-patch FRED UA bug). Unload the plist before relying on this job: launchctl unload ~/Library/LaunchAgents/com.terminal3c.claims-data.plist"
+    },
+    {
+      "name": "t2_daily_picks",
+      "command": "/opt/homebrew/bin/python3 ~/Documents/terminal2_daily_t5_picks.py --skip-scan",
+      "interval_sec": 86400,
+      "timeout_sec": 300,
+      "enabled": false,
+      "_notes": "Migrated 2026-05-08 from com.t2.daily-picks.plist (was exit=78 \u2014 TCC bite, never ran successfully). Unload the plist: launchctl unload ~/Library/LaunchAgents/com.t2.daily-picks.plist. Pipeline is dormant on archetype_calibration anyway (calendar_fade n<3); this just keeps the daily snapshot fresh. | DISABLED 2026-05-09 \u2014 T2 archived after 0/8 thesis kill (CoWork diagnosis)."
+    },
+    {
+      "name": "t6_mlb_lines_puller",
+      "command": "/opt/homebrew/bin/python3 ~/Documents/terminal6_mlb_lines_puller.py --once",
+      "interval_sec": 5400,
+      "timeout_sec": 120,
+      "enabled": true,
+      "_notes": "T6 sharp Vegas line pull. 90-min cadence stays under Odds API free tier (500 req/mo, 16/day \u00d7 30 = 480). DISABLED until Odds API key is set at ~/Documents/.odds_api_key. To enable: (1) get free key at the-odds-api.com, (2) echo KEY > ~/Documents/.odds_api_key, (3) flip enabled=true here, (4) kill -HUP $(cat ~/Documents/scheduler.pid)."
+    },
+    {
+      "name": "entropy_collapse_detector",
+      "command": "/opt/homebrew/bin/python3 ~/Documents/entropy_collapse_detector.py --once",
+      "interval_sec": 300,
+      "timeout_sec": 60,
+      "enabled": true,
+      "_notes": "Cross-engine informed-flow detector. Reads kalshi snapshot files for T3a/T3b/T3c, computes entropy z-score with within-event rolling baseline + liquidity gate (vol > median \u00d7 1.5 AND |z| > 3). Writes alerts to ~/Documents/entropy_alerts.jsonl. Phase 1 use is DEFENSIVE only \u2014 traders consult alerts to refuse fading-collapse entries. Phase 2 (after n>=15 calibrated alerts) adds offensive directional entry."
+    }
+  ]
+}
