@@ -608,97 +608,96 @@ def _build_hero(state, phase, R):
 # ─────────────────── ENGINE CARD ───────────────────
 
 def _build_engine_card(eid: str, state, phase, R):
-    box = R["box"]; Align = R["Align"]; Padding = R["Padding"]
-    Panel = R["Panel"]; Text = R["Text"]; Group = R["Group"]
+    """Both cards use a fixed-row Table so T6 and T7 are guaranteed
+    identical layout regardless of content. The gate-bar row is the
+    differentiator: T6 shows a shimmering progress bar, T7 shows a
+    'awaiting first close / N closes settled' subline — same row count."""
+    box = R["box"]; Padding = R["Padding"]
+    Panel = R["Panel"]; Text = R["Text"]
+    from rich.table import Table
 
     e = state["per_engine"][eid]
     realized = e["realized"]
     pnl_color = _pnl_color(realized)
 
-    big = Text(no_wrap=True, justify="left")
-    big.append(f"${realized:+,.2f}", style=f"bold {pnl_color}")
-    big.append("   ", style="")
-    big.append(_pnl_arrow(realized), style=pnl_color)
-    big.append(f"   {e['wins']}", style=f"bold {OK}")
-    big.append(" W  ·  ", style=LABEL)
-    big.append(f"{e['losses']}", style=f"bold {DANGER}")
-    big.append(" L", style=LABEL)
+    t = Table(
+        show_header=False, show_edge=False, box=None,
+        expand=True, padding=(0, 1), pad_edge=False,
+    )
+    t.add_column("label", style=LABEL, justify="left", width=10, no_wrap=True)
+    t.add_column("value", justify="left", no_wrap=True, overflow="ellipsis")
 
-    mode_text = Text(no_wrap=True)
-    mode_text.append(e["mode"].upper(), style=f"bold {ACCENT}")
-    mode_text.append(f"   bankroll ", style=LABEL)
-    mode_text.append(f"${e['bankroll']:,.0f}", style=HEADING)
+    # Row 1 — Realized (big)
+    realized_cell = Text(no_wrap=True)
+    realized_cell.append(f"${realized:+,.2f}", style=f"bold {pnl_color}")
+    realized_cell.append(f"  {_pnl_arrow(realized)}", style=pnl_color)
+    t.add_row("REALIZED", realized_cell)
 
-    daemon_glyph, daemon_style = _pulse_dot(e["daemon_alive"], False, phase)
-    grid = Text(no_wrap=True)
-    grid.append("  open      ", style=LABEL)
-    grid.append(f"{e['open']:<6}", style="bold yellow" if e["open"] > 0 else "white")
-    grid.append("last fire   ", style=LABEL)
-    grid.append(f"{e['last_fire']:<12}", style="white")
-    grid.append(f"{daemon_glyph} ", style=daemon_style)
-    grid.append("daemon", style=LABEL)
+    # Row 2 — Wins/Losses
+    wl_cell = Text(no_wrap=True)
+    wl_cell.append(f"{e['wins']}", style=f"bold {OK}")
+    wl_cell.append(" W  ·  ", style=LABEL)
+    wl_cell.append(f"{e['losses']}", style=f"bold {DANGER}")
+    wl_cell.append(" L", style=LABEL)
+    t.add_row("W / L", wl_cell)
 
-    # Gate block — TWO LINES always so both engine cards have identical height.
-    # T6: gate label + shimmering progress bar (n/300 validator)
-    # T7: gate label + closes/runway summary (no validator gate by design)
+    # Row 3 — Mode
+    t.add_row("MODE", Text(e["mode"].upper(), style=f"bold {ACCENT}", no_wrap=True))
+
+    # Row 4 — Bankroll
+    t.add_row("BANKROLL", Text(f"${e['bankroll']:,.0f}", style=HEADING, no_wrap=True))
+
+    # Row 5 — Open positions
+    open_style = f"bold {WARN}" if e["open"] > 0 else "white"
+    t.add_row("OPEN", Text(str(e["open"]), style=open_style, no_wrap=True))
+
+    # Row 6 — Last fire (from ledger)
+    t.add_row("LAST FIRE", Text(e["last_fire"], style="white", no_wrap=True))
+
+    # Row 7 — Daemon health (with pulsing dot)
+    glyph, glyph_style = _pulse_dot(e["daemon_alive"], False, phase)
+    daemon_cell = Text(no_wrap=True)
+    daemon_cell.append(f"{glyph} ", style=glyph_style)
+    daemon_cell.append("alive" if e["daemon_alive"] else "DOWN",
+                       style="white" if e["daemon_alive"] else f"bold {DANGER}")
+    t.add_row("DAEMON", daemon_cell)
+
+    # Row 8 — Gate label
+    sev = e["gate_severity"]
+    gate_color = (
+        DANGER if sev == "red" else
+        OK     if sev == "green" else
+        WARN   if sev == "yellow" else
+        (OK if e["gate"] == "ACTIVE" else ACCENT)
+    )
+    t.add_row("GATE", Text(e["gate"], style=f"bold {gate_color}", no_wrap=True))
+
+    # Row 9 — Progress bar (T6) or close summary (T7) — always present.
     if e["gate_n"] is not None and e["gate_target"]:
         bar, base_style, shimmer_pos = _shimmer_bar(
             e["gate_n"], e["gate_target"], phase, width=22
         )
-        sev = e["gate_severity"]
-        gate_color = (
-            DANGER if sev == "red" else
-            OK     if sev == "green" else
-            WARN   if sev == "yellow" else
-            ACCENT
-        )
-        label_line = Text(no_wrap=True)
-        label_line.append("  ")
-        label_line.append(e["gate"], style=f"bold {gate_color}")
-        label_line.append(f"  ·  validator gate", style=LABEL)
-
-        bar_line = Text(no_wrap=True)
-        bar_line.append("  ")
+        bar_cell = Text(no_wrap=True)
         for i, ch in enumerate(bar):
             if i == shimmer_pos:
-                bar_line.append(ch, style="bold bright_white")
+                bar_cell.append(ch, style="bold bright_white")
             else:
-                bar_line.append(ch, style=base_style)
+                bar_cell.append(ch, style=base_style)
         pct = 100.0 * e["gate_n"] / e["gate_target"]
-        bar_line.append(f"  {e['gate_n']}/{e['gate_target']}", style=HEADING)
-        bar_line.append(f" ({pct:.1f}%)", style=LABEL)
-        gate_lines = [label_line, bar_line]
+        bar_cell.append(f"  {e['gate_n']}/{e['gate_target']}", style=HEADING)
+        bar_cell.append(f"  ({pct:.1f}%)", style=LABEL)
+        t.add_row("", bar_cell)
     else:
-        # Non-validator engine (T7) — same two-line shape as T6.
-        gate_color = OK if e["gate"] == "ACTIVE" else LABEL
-        label_line = Text(no_wrap=True)
-        label_line.append("  ")
-        label_line.append(e["gate"], style=f"bold {gate_color}")
-        label_line.append(f"  ·  no validator gate", style=LABEL)
-
         n_closes = e["wins"] + e["losses"]
-        sub_line = Text(no_wrap=True)
-        sub_line.append("  ")
         if n_closes == 0:
-            sub_line.append("awaiting first close", style=LABEL)
+            sub = Text("awaiting first close", style=LABEL, no_wrap=True)
         else:
-            sub_line.append(f"{n_closes} close{'s' if n_closes != 1 else ''} settled",
-                            style="white")
-        gate_lines = [label_line, sub_line]
-
-    body = Group(
-        Text(""),
-        Align.left(big),
-        Text(""),
-        Align.left(mode_text),
-        Text(""),
-        grid,
-        Text(""),
-        *gate_lines,
-    )
+            sub = Text(f"{n_closes} close{'s' if n_closes != 1 else ''} settled",
+                       style="white", no_wrap=True)
+        t.add_row("", sub)
 
     return Panel(
-        Padding(body, (0, 2)),
+        Padding(t, (1, 1)),
         title=f"[{ACCENT}]{e['title']}[/]",
         title_align="left",
         border_style=ACCENT,
