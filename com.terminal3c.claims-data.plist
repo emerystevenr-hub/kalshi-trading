@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.terminal3c.claims-data</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>/Users/stevenemery/Documents/terminal3c_claims_data.py</string>
+    </array>
+
+    <!-- Fire twice daily (Bend local time):
+         06:00 PT — ~30-90 min after Thursday's 8:30 ET DOL release
+         18:00 PT — captures any same-day revisions
+         The script is idempotent (merge-on-date), so duplicate fires are no-op. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>6</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>18</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/stevenemery/Documents/terminal3c_data/claims_data.out</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/stevenemery/Documents/terminal3c_data/claims_data.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

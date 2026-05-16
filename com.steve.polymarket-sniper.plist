@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Unique identifier — must match the filename -->
+    <key>Label</key>
+    <string>com.steve.polymarket-sniper</string>
+
+    <!-- What to run. REPLACE PYTHON_PATH with output of: which python3 -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>-u</string>
+        <string>/Users/stevenemery/Documents/sniper.py</string>
+    </array>
+
+    <!-- Force unbuffered output so logs flush immediately -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+
+    <!-- Run from the Documents directory so config.py imports work -->
+    <key>WorkingDirectory</key>
+    <string>/Users/stevenemery/Documents</string>
+
+    <!-- Auto-restart on crash -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Start automatically at login -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Throttle restart attempts to avoid runaway CPU on persistent crash -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Capture stdout/stderr to log files -->
+    <key>StandardOutPath</key>
+    <string>/Users/stevenemery/Documents/sniper.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/stevenemery/Documents/sniper.error.log</string>
+</dict>
+</plist>

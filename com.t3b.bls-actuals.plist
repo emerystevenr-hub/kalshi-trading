@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.t3b.bls-actuals</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>/Users/stevenemery/Documents/terminal3b_bls_actuals.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/stevenemery/Documents</string>
+
+    <!-- Run daily at 14:00 UTC (= 07:00 PT during PDT, 06:00 PT during PST).
+         BLS CPI releases at 12:30 UTC on release Tuesdays — this gives a
+         ~90 min buffer. Times in this plist are local; macOS launchd does
+         not support UTC scheduling natively. 07:00 local approximates the
+         07:00 PT target year-round (acceptable drift on PST mornings). -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>7</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- Run once at load too — closes the gap if the laptop just woke up. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/stevenemery/Documents/terminal3b_data/bls_actuals.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/stevenemery/Documents/terminal3b_data/bls_actuals.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/stevenemery</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

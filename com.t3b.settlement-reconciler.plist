@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.t3b.settlement-reconciler</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>/Users/stevenemery/Documents/terminal3b_settlement_reconciler.py</string>
+        <string>--interval-sec</string>
+        <string>3600</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/stevenemery/Documents</string>
+
+    <!-- KeepAlive: respawn if the process exits for any reason.
+         The reconciler is a long-running daemon (1h poll interval). If it
+         crashes, we want launchd to bring it back. SuccessfulExit=false
+         means "respawn on non-zero exit too." -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Run at load — closes the gap if the laptop just woke up. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Crash protection: pause 30s before respawn after a crash to avoid
+         hot-loop on persistent failure. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/stevenemery/Documents/terminal3b_data/settlement_reconciler.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/stevenemery/Documents/terminal3b_data/settlement_reconciler.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/stevenemery</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.terminal1.nws-actuals</string>
+
+    <!-- Direct python3 invocation. Earlier version wrapped this in
+         /usr/bin/caffeinate -i ... and silently exited 78 (EX_CONFIG)
+         under launchd starting 2026-05-01. Pull is 4 seconds; caffeinate
+         buys nothing. Replicating the calibration-trend pattern, which
+         has been exiting 0 reliably. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>/Users/stevenemery/Documents/terminal1_nws_actuals.py</string>
+        <string>--backfill-days</string>
+        <string>3</string>
+    </array>
+
+    <!-- Every 6 hours = 21600 seconds. -->
+    <key>StartInterval</key>
+    <integer>21600</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/stevenemery/Documents/terminal1_actuals.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/stevenemery/Documents/terminal1_actuals.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/stevenemery/Documents</string>
+</dict>
+</plist>
