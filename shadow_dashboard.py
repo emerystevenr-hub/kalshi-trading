@@ -1,47 +1,35 @@
-"""Shadow P&L Dashboard — fixed-layout terminal scoreboard (session 7 rewrite).
+"""Shadow P&L Dashboard — full-screen rich terminal UI (session 7 v3).
 
-Single 80x24 screen. Refreshes in place every 30 seconds (configurable).
-No scrolling, ever. Archived engines (T1, T2, T4, T5) never appear.
+In-place refresh every 30s via rich.live.Live. No scrolling, ever.
+Only T6 and T7 render. T3a/T3b/T3c/T1/T2/T4/T5 never appear.
 
-Layout:
-  HEADER     portfolio total clean realized | macro cap % | Odds API | UTC
-  ENGINES    T3a | T3b | T3c | T6 | T7 — one line each
-             columns: mode | clean realized | W/L | open | last fire | gate
-  ALERTS     daemon down, 401s, cap breach, freshness alarm, entropy event
-             Empty box collapses to a single green "NO ALERTS" line.
-  FOOTER     last refresh | next refresh in Xs
+Layout (top → bottom):
+  HEADER    portfolio realized | macro cap % | Odds API credits | UTC timestamp
+  ENGINES   T6 + T7 — Engine | Mode | Clean Realized | W/L | Open | Last Fire | Gate
+            T6 Gate is a progress bar: n/300 visual + numeric
+  ALERTS    only shown if alerts exist; otherwise single green "✓ All systems nominal"
+  FOOTER    refreshed HH:MM:SS UTC | next in Xs
 
-T6 P&L, W/L, and gate are sourced from terminal6_milestone_check (clean
-numbers only — never raw ledger). T3a's "PAUSED until <date>" line is
-driven by the presence of ~/Documents/t3a_disabled_until.flag (auto-cleared
-by the Cowork scheduled task t3a-fed-scanner-relaunch-jun10 on 2026-06-10).
+Data sources:
+  shadow_pnl/engines.json + ledger.jsonl       — bankroll + raw P&L
+  terminal6_milestone_check                    — clean T6 P&L + gate verdict (source of truth)
+  scheduler_status.json + scheduler.pid        — daemon health
+  freshness_alarm.flag + macro_cap_alarm.flag  — alert flags
+  entropy_alerts.jsonl                         — entropy events
+  scheduler_logs/t6_mlb_lines_puller.log       — Odds API credits remaining
+  terminal{6,7}_data/ws_logger.log             — engine "last fire" mtime
 
 Usage:
-    python3 ~/Documents/shadow_dashboard.py                # 30s refresh
-    python3 ~/Documents/shadow_dashboard.py --refresh-sec 10
-    python3 ~/Documents/shadow_dashboard.py --once         # dump JSON, no curses
-    python3 ~/Documents/shadow_dashboard.py --plain        # no-curses fallback
+  python3 ~/Documents/shadow_dashboard.py
+  python3 ~/Documents/shadow_dashboard.py --refresh-sec 10
+  python3 ~/Documents/shadow_dashboard.py --once    # JSON dump for smoke test
 
-Reads (never writes):
-  ~/Documents/shadow_pnl/engines.json
-  ~/Documents/shadow_pnl/ledger.jsonl
-  ~/Documents/scheduler_status.json
-  ~/Documents/scheduler.pid
-  ~/Documents/freshness_alarm.flag
-  ~/Documents/macro_cap_alarm.flag
-  ~/Documents/t3a_disabled_until.flag
-  ~/Documents/entropy_alerts.jsonl
-  ~/Documents/scheduler_logs/t6_mlb_lines_puller.log
-  ~/Documents/terminal{3a,3b,6,7}_data/*.log
-
-Imports:
-  terminal6_milestone_check  (clean T6 P&L + gate — single source of truth)
+Install once: pip install rich --break-system-packages
 """
 
 from __future__ import annotations
 
 import argparse
-import curses
 import json
 import os
 import re
@@ -51,13 +39,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# Single source of truth for clean T6 numbers + gate verdict. See
-# terminal6_dashboard.py session-7 refactor commentary for the rationale.
 from terminal6_milestone_check import (
     load_t6_closed,
     _is_contaminated,
     compute_stats,
     evaluate_gate,
+    VALIDATE_N,
 )
 
 DOCS = Path.home() / "Documents"
@@ -68,32 +55,27 @@ SCHED_STATUS = DOCS / "scheduler_status.json"
 SCHED_PID = DOCS / "scheduler.pid"
 FRESHNESS_FLAG = DOCS / "freshness_alarm.flag"
 MACRO_FLAG = DOCS / "macro_cap_alarm.flag"
-T3A_PAUSE_FLAG = DOCS / "t3a_disabled_until.flag"
 ENTROPY_ALERTS = DOCS / "entropy_alerts.jsonl"
 T6_LINES_LOG = DOCS / "scheduler_logs" / "t6_mlb_lines_puller.log"
 
-# Per-engine logger paths (used for "last fire" + daemon-down detection).
-# Loggers tick every 5 min; >15 min stale triggers a daemon-down alert.
-# Session 7 final: T3b + T3c archived. T3a daemon killed but bankroll placeholder
-# retained as the sole macro engine. ENGINE_LOGS keeps T3a's path so the "paused"
-# status line still resolves; the daemon-down alert is suppressed via the pause flag.
+# Engines that render — and ONLY these. T3a/T3b/T3c/T1/T2/T4/T5 never appear.
+ACTIVE_ENGINE_ORDER = ["T6", "T7"]
+
+# Per-engine logger paths verified 2026-05-16 session 7 v3 against ls output:
+#   T6 writes ws_logger.log every 5s (WS feed) → 5-min staleness = daemon down
+#   T7 writes ws_logger.log too                → same threshold
 ENGINE_LOGS = {
-    "T3a": DOCS / "terminal3a_data" / "fed_scanner.log",
-    "T6":  DOCS / "terminal6_data"  / "kalshi_logger.log",
-    "T7":  DOCS / "terminal7_data"  / "kalshi_logger.log",
+    "T6": DOCS / "terminal6_data" / "ws_logger.log",
+    "T7": DOCS / "terminal7_data" / "ws_logger.log",
 }
 
-# Engines that ALWAYS render (in order). T1/T2/T3b/T3c/T4/T5 never appear.
-# Session 7 archived T3b + T3c with bankroll reallocated to T6 ($13K → $18K).
-ACTIVE_ENGINE_ORDER = ["T3a", "T6", "T7"]
-
-DAEMON_STALE_SEC = 15 * 60   # logger silent > 15m = daemon down
-ENTROPY_RECENT_SEC = 60 * 60  # entropy event from last hour = alert
-ODDS_API_LOW_CREDITS = 50    # < 50 remaining = alert
+DAEMON_STALE_SEC = 5 * 60    # WS logger silent > 5 min = daemon down
+ENTROPY_RECENT_SEC = 60 * 60
+ODDS_API_LOW_CREDITS = 50
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Helpers (pure — no curses, no I/O side-effects)
+# Pure helpers (no I/O side effects, no rich dependencies)
 # ─────────────────────────────────────────────────────────────────────
 
 def _read_jsonl(path: Path) -> List[dict]:
@@ -144,20 +126,12 @@ def _proc_alive(pid: int) -> bool:
         return False
     try:
         os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError):
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
         return False
-    except OSError:
-        return False
-    return True
 
-
-# ─────────────────────────────────────────────────────────────────────
-# Per-engine stats from the shadow_pnl ledger
-# ─────────────────────────────────────────────────────────────────────
 
 def _engine_ledger_stats(ledger: List[dict], engine: str) -> Tuple[float, int, int, int]:
-    """Return (realized_pnl, wins, losses, open_count) for one engine
-    using raw ledger only. T6 is overridden by milestone_check in the caller."""
     opens: Dict[str, dict] = {}
     closed_pids: set = set()
     pnl = 0.0
@@ -182,13 +156,12 @@ def _engine_ledger_stats(ledger: List[dict], engine: str) -> Tuple[float, int, i
 
 
 def _t6_clean_stats() -> Tuple[float, int, int, int, dict]:
-    """Clean T6 numbers + gate, sourced from terminal6_milestone_check.
+    """Clean T6 numbers + gate — sourced from terminal6_milestone_check.
     Returns (clean_total_pnl, wins, losses, open_count, gate_dict)."""
     all_closes = load_t6_closed()
     clean = [c for c in all_closes if not _is_contaminated(c)]
     stats = compute_stats(clean)
     gate = evaluate_gate(stats)
-    # Open positions: from ledger — count T6 opens with no matching close.
     open_pids: Dict[str, bool] = {}
     closed_pids: set = set()
     for r in _read_jsonl(LEDGER):
@@ -205,16 +178,10 @@ def _t6_clean_stats() -> Tuple[float, int, int, int, dict]:
     return round(stats["total_pnl"], 2), stats["wins"], stats["losses"], open_count, gate
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Macro cap %
-# ─────────────────────────────────────────────────────────────────────
-
 def _macro_cap_pct(engines: dict) -> Optional[float]:
-    """% of TOTAL deployed bankroll allocated to macro-category engines.
-    Returns None if engines.json has no usable bankroll fields."""
     macro = 0.0
     total = 0.0
-    for eid, meta in engines.items():
+    for meta in engines.values():
         if not meta.get("active"):
             continue
         bk = float(meta.get("bankroll_usd") or 0)
@@ -228,10 +195,6 @@ def _macro_cap_pct(engines: dict) -> Optional[float]:
     return 100.0 * macro / total
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Odds API credits — tail t6 lines puller log for "remaining=N"
-# ─────────────────────────────────────────────────────────────────────
-
 _REMAIN_RE = re.compile(r"remaining=(\d+)")
 
 
@@ -240,7 +203,6 @@ def _odds_api_credits() -> Optional[int]:
         return None
     try:
         with open(T6_LINES_LOG) as f:
-            # Tail the last ~16KB and scan for the last remaining=N
             f.seek(0, os.SEEK_END)
             size = f.tell()
             f.seek(max(0, size - 16384))
@@ -253,64 +215,44 @@ def _odds_api_credits() -> Optional[int]:
     return last
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Last-fire per engine
-# ─────────────────────────────────────────────────────────────────────
-
-def _scheduler_last_run(sched_status: dict, job_name: str) -> Optional[float]:
-    for j in sched_status.get("jobs", []):
-        if j.get("name") == job_name:
+def _scheduler_last_run(sched: dict, job: str) -> Optional[float]:
+    for j in sched.get("jobs", []):
+        if j.get("name") == job:
             return j.get("last_run_ts")
     return None
 
 
-def _last_fire_age(engine: str, sched_status: dict) -> Optional[float]:
-    """Seconds since the engine's most recent activity, or None if unknown.
-    Priority: continuous logger mtime > scheduler job last_run_ts."""
+def _last_fire_age(engine: str, sched: dict) -> Optional[float]:
     log = ENGINE_LOGS.get(engine)
     if log:
         mt = _file_mtime(log)
         if mt is not None:
             return time.time() - mt
-    # Fall back to scheduler job for engines without a continuous logger.
-    job_map = {
-        "T3c": "t3c_claims_data",
-        "T6":  "t6_mlb_lines_puller",  # only used if T6 logger file missing
-    }
-    job = job_map.get(engine)
-    if job:
-        ts = _scheduler_last_run(sched_status, job)
+    if engine == "T6":
+        ts = _scheduler_last_run(sched, "t6_mlb_lines_puller")
         if ts:
             return time.time() - ts
     return None
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Alerts
-# ─────────────────────────────────────────────────────────────────────
-
 def _build_alerts(state: dict) -> List[Tuple[str, str]]:
-    """Return list of (severity, message). severity in {'red','yellow'}.
-    Order is fixed-priority: cap > freshness > daemon-down > odds > entropy > scheduler."""
+    """Return [(severity, message), ...]. severity in {'red','yellow'}."""
     alerts: List[Tuple[str, str]] = []
 
-    # Cap breach
     if MACRO_FLAG.exists():
         try:
             msg = MACRO_FLAG.read_text().strip().splitlines()[0]
         except OSError:
             msg = "macro cap breached"
-        alerts.append(("red", f"MACRO CAP: {msg[:60]}"))
+        alerts.append(("red", f"MACRO CAP: {msg[:64]}"))
 
-    # Freshness
     if FRESHNESS_FLAG.exists():
         try:
             msg = FRESHNESS_FLAG.read_text().strip().splitlines()[0]
         except OSError:
             msg = "freshness alarm raised"
-        alerts.append(("red", f"FRESHNESS: {msg[:60]}"))
+        alerts.append(("red", f"FRESHNESS: {msg[:64]}"))
 
-    # Scheduler process down
     if SCHED_PID.exists():
         try:
             pid = int(SCHED_PID.read_text().strip())
@@ -319,17 +261,12 @@ def _build_alerts(state: dict) -> List[Tuple[str, str]]:
         except (ValueError, OSError):
             pass
 
-    # Daemon down (logger silent > 15 min). T3a skipped if paused.
-    paused_engines = {"T3a"} if T3A_PAUSE_FLAG.exists() else set()
     for eng in ACTIVE_ENGINE_ORDER:
-        if eng in paused_engines:
-            continue
         log = ENGINE_LOGS.get(eng)
         if not log:
             continue
         mt = _file_mtime(log)
         if mt is None:
-            # Logger file never existed — only alert if engine is active in engines.json
             if state["engines_meta"].get(eng, {}).get("active"):
                 alerts.append(("yellow", f"{eng} LOGGER: no log file at {log.name}"))
             continue
@@ -337,40 +274,34 @@ def _build_alerts(state: dict) -> List[Tuple[str, str]]:
         if age > DAEMON_STALE_SEC:
             alerts.append(("red", f"{eng} DAEMON DOWN: logger silent {_fmt_age(age)}"))
 
-    # Odds API low credits
     credits = state.get("odds_api_credits")
     if credits is not None and credits < ODDS_API_LOW_CREDITS:
         alerts.append(("red", f"ODDS API: only {credits} credits remaining"))
 
-    # Entropy event in last hour with non-noise level
     for rec in reversed(_read_jsonl(ENTROPY_ALERTS)[-200:]):
         if rec.get("alert_level") in (None, "noise"):
             continue
-        ts_str = rec.get("ts") or ""
         try:
-            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            ts = datetime.fromisoformat((rec.get("ts") or "").replace("Z", "+00:00"))
             age = (datetime.now(timezone.utc) - ts).total_seconds()
         except (TypeError, ValueError):
             continue
         if age > ENTROPY_RECENT_SEC:
-            break  # records are time-ordered; older ones irrelevant
-        alerts.append(("yellow", f"ENTROPY: {rec.get('engine')} {rec.get('ticker','?')[:30]} "
-                                 f"z={rec.get('z_score',0):.1f} {_fmt_age(age)}"))
-        break  # only show the most recent
+            break
+        if rec.get("engine") not in ACTIVE_ENGINE_ORDER:
+            continue   # entropy on an archived engine is noise — suppress
+        alerts.append(("yellow",
+                       f"ENTROPY: {rec.get('engine')} {rec.get('ticker', '?')[:30]} "
+                       f"z={rec.get('z_score', 0):.1f} {_fmt_age(age)}"))
+        break
 
-    # Scheduler job non-zero exit
     for j in state.get("scheduler_status", {}).get("jobs", []):
         ec = j.get("last_exit_code")
         if ec is not None and ec != 0:
-            alerts.append(("yellow",
-                           f"SCHEDULER JOB: {j['name']} last exit={ec}"))
+            alerts.append(("yellow", f"SCHEDULER JOB: {j['name']} last exit={ec}"))
 
-    return alerts[:10]  # hard cap so alert box can't grow past the screen
+    return alerts[:10]
 
-
-# ─────────────────────────────────────────────────────────────────────
-# State assembly
-# ─────────────────────────────────────────────────────────────────────
 
 def gather_state() -> dict:
     engines_meta = _read_json(ENGINES_JSON)
@@ -379,40 +310,39 @@ def gather_state() -> dict:
     credits = _odds_api_credits()
     cap_pct = _macro_cap_pct(engines_meta)
 
-    # Per-engine rows
     per_engine: Dict[str, dict] = {}
     portfolio_realized = 0.0
     for eid in ACTIVE_ENGINE_ORDER:
         meta = engines_meta.get(eid, {})
         if eid == "T6":
             pnl, wins, losses, open_count, gate = _t6_clean_stats()
-            gate_str = f"{gate['gate']} n={wins+losses}/300"
+            n = wins + losses
+            gate_str = f"{gate['gate']} n={n}/{VALIDATE_N}"
+            gate_n, gate_target = n, VALIDATE_N
+            gate_severity = (
+                "red" if gate["gate"] in ("EARLY_KILL", "DEAD") else
+                "green" if gate["gate"] == "VALIDATED" else
+                "yellow" if gate["gate"] == "INCONCLUSIVE" else
+                "normal"
+            )
         else:
             pnl, wins, losses, open_count = _engine_ledger_stats(ledger, eid)
             gate_str = "active" if meta.get("active") else "idle"
-
-        # Mode override: T3a paused flag wins.
-        if eid == "T3a" and T3A_PAUSE_FLAG.exists():
-            mode = "paused"
-            try:
-                until = T3A_PAUSE_FLAG.read_text().splitlines()[0].strip()
-                # Pretty-print "2026-06-10T16:00:00Z" → "2026-06-10"
-                gate_str = f"PAUSED until {until[:10]}"
-            except OSError:
-                gate_str = "PAUSED"
-        else:
-            mode = meta.get("mode") or ("active" if meta.get("active") else "idle")
+            gate_n = gate_target = None
+            gate_severity = "normal"
 
         age_sec = _last_fire_age(eid, sched)
         per_engine[eid] = {
-            "mode": (mode or "?")[:8],
+            "mode": meta.get("mode") or ("active" if meta.get("active") else "idle"),
             "realized": pnl,
             "wins": wins,
             "losses": losses,
             "open": open_count,
             "last_fire": _fmt_age(age_sec) if age_sec is not None else "—",
-            "last_fire_sec": age_sec,
-            "gate": gate_str[:24],
+            "gate": gate_str,
+            "gate_n": gate_n,
+            "gate_target": gate_target,
+            "gate_severity": gate_severity,
         }
         portfolio_realized += pnl
 
@@ -430,245 +360,207 @@ def gather_state() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Curses render
+# Rich renderer
 # ─────────────────────────────────────────────────────────────────────
 
-# Color pair indexes
-C_DEFAULT = 0
-C_GREEN = 1
-C_RED = 2
-C_YELLOW = 3
-C_CYAN = 4
-C_DIM = 5
+def _import_rich():
+    """Lazy import so --once smoke test runs without rich installed."""
+    from rich.console import Console
+    from rich.layout import Layout
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from rich.align import Align
+    return Console, Layout, Live, Panel, Table, Text, Align
 
 
-def _init_colors() -> None:
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(C_GREEN,  curses.COLOR_GREEN,  -1)
-    curses.init_pair(C_RED,    curses.COLOR_RED,    -1)
-    curses.init_pair(C_YELLOW, curses.COLOR_YELLOW, -1)
-    curses.init_pair(C_CYAN,   curses.COLOR_CYAN,   -1)
-    curses.init_pair(C_DIM,    curses.COLOR_WHITE,  -1)
+def _pnl_text(value: float, width: int = 11):
+    from rich.text import Text
+    color = "bright_green" if value > 0 else ("bright_red" if value < 0 else "white")
+    return Text(f"${value:>+{width-1}.2f}", style=f"bold {color}")
 
 
-def _pnl_attr(v: float) -> int:
-    if v > 0:
-        return curses.color_pair(C_GREEN)
-    if v < 0:
-        return curses.color_pair(C_RED)
-    return curses.A_NORMAL
+def _macro_text(pct: Optional[float]):
+    from rich.text import Text
+    if pct is None:
+        return Text("?", style="dim")
+    if pct >= 50.0:
+        return Text(f"{pct:.1f}%", style="bold bright_red")
+    if pct >= 45.0:
+        return Text(f"{pct:.1f}%", style="bold yellow")
+    return Text(f"{pct:.1f}%", style="bold bright_green")
 
 
-def _safe_addstr(win, row, col, text, attr=0) -> None:
-    """addstr that silently clips at the right edge instead of raising."""
-    h, w = win.getmaxyx()
-    if row < 0 or row >= h or col < 0 or col >= w:
-        return
-    try:
-        win.addnstr(row, col, text, max(0, w - col - 1), attr)
-    except curses.error:
-        pass
+def _odds_text(credits: Optional[int]):
+    from rich.text import Text
+    if credits is None:
+        return Text("?", style="dim")
+    if credits < ODDS_API_LOW_CREDITS:
+        return Text(f"{credits:,}", style="bold bright_red")
+    return Text(f"{credits:,}", style="bright_green")
 
 
-def render(stdscr, state: dict, refresh_sec: int, next_in: int) -> None:
-    stdscr.erase()
-    h, w = stdscr.getmaxyx()
-    # Layout assumes 80x24 minimum; gracefully bail if too small.
-    if h < 16 or w < 78:
-        _safe_addstr(stdscr, 0, 0,
-                     f"terminal too small: need ≥80x24, got {w}x{h}",
-                     curses.color_pair(C_RED))
-        stdscr.refresh()
-        return
+def _gate_progress_bar(n: int, target: int, width: int = 20) -> str:
+    """ASCII progress bar for T6 validator gate."""
+    if target <= 0:
+        return ""
+    filled = max(0, min(width, int(round(width * n / target))))
+    return "▰" * filled + "▱" * (width - filled)
 
-    # ── HEADER ──────────────────────────────────────────────────────
+
+def _build_header_panel(state, Panel, Text, Align):
     now_s = state["now_utc"].strftime("%Y-%m-%d %H:%M:%S UTC")
     realized = state["portfolio_realized"]
-    cap = state["macro_cap_pct"]
-    credits = state["odds_api_credits"]
+    body = Text(no_wrap=True, overflow="ellipsis")
+    body.append(" PORTFOLIO  ", style="bold cyan")
+    body.append("realized=", style="dim")
+    body.append(_pnl_text(realized, 10))
+    body.append("   macro=", style="dim")
+    body.append(_macro_text(state["macro_cap_pct"]))
+    body.append("   odds=", style="dim")
+    body.append(_odds_text(state["odds_api_credits"]))
+    body.append(f"   {now_s}", style="dim")
+    return Panel(Align.left(body), border_style="cyan", padding=(0, 1))
 
-    cap_str = f"{cap:.1f}%" if cap is not None else "?"
-    credits_str = f"{credits}" if credits is not None else "?"
 
-    _safe_addstr(stdscr, 0, 0, " " * (w - 1), curses.A_REVERSE)
-    _safe_addstr(stdscr, 0, 1, " PORTFOLIO ",
-                 curses.A_REVERSE | curses.A_BOLD)
-    _safe_addstr(stdscr, 0, 12, f"realized=", curses.A_REVERSE)
-    _safe_addstr(stdscr, 0, 21, f"${realized:+9.2f}",
-                 curses.A_REVERSE | _pnl_attr(realized))
-    _safe_addstr(stdscr, 0, 32, f"  macro={cap_str:>6}", curses.A_REVERSE)
-    _safe_addstr(stdscr, 0, 48, f"  odds={credits_str:>5}", curses.A_REVERSE)
-    _safe_addstr(stdscr, 0, 62, f"  {now_s}", curses.A_REVERSE)
-
-    # ── ENGINE TABLE ────────────────────────────────────────────────
-    row = 2
-    hdr = f" {'ENG':<4} {'mode':<8} {'clean_real':>11}  {'W/L':>7}  {'open':>4}  {'last_fire':<10}  {'gate':<24}"
-    _safe_addstr(stdscr, row, 0, hdr, curses.A_BOLD | curses.color_pair(C_CYAN))
-    row += 1
-    _safe_addstr(stdscr, row, 0, "─" * (w - 1), curses.color_pair(C_DIM))
-    row += 1
+def _build_engine_table(state, Panel, Table, Text):
+    table = Table(
+        show_header=True,
+        header_style="bold cyan",
+        expand=True,
+        pad_edge=False,
+        padding=(0, 1),
+    )
+    table.add_column("Engine", style="bold", no_wrap=True, width=8)
+    table.add_column("Mode", no_wrap=True, width=9)
+    table.add_column("Clean Realized", justify="right", no_wrap=True, width=15)
+    table.add_column("W/L", justify="right", no_wrap=True, width=8)
+    table.add_column("Open", justify="right", no_wrap=True, width=5)
+    table.add_column("Last Fire", no_wrap=True, width=11)
+    table.add_column("Gate Status", no_wrap=False)
 
     for eid in ACTIVE_ENGINE_ORDER:
         e = state["per_engine"][eid]
-        wl = f"{e['wins']}/{e['losses']}"
-        # Build the row in segments so we can color the P&L cell only.
-        _safe_addstr(stdscr, row, 0, f" {eid:<4} {e['mode']:<8} ")
-        _safe_addstr(stdscr, row, 15, f"${e['realized']:>+10.2f}",
-                     _pnl_attr(e['realized']))
-        _safe_addstr(stdscr, row, 27,
-                     f"  {wl:>7}  {e['open']:>4}  "
-                     f"{e['last_fire']:<10}  {e['gate']:<24}")
+        # Gate cell — progress bar for T6, plain text for others.
+        if e["gate_n"] is not None and e["gate_target"]:
+            bar = _gate_progress_bar(e["gate_n"], e["gate_target"])
+            gate_style = {
+                "red": "bold bright_red",
+                "green": "bold bright_green",
+                "yellow": "yellow",
+                "normal": "white",
+            }[e["gate_severity"]]
+            gate_cell = Text()
+            gate_cell.append(f"{e['gate'].split(' n=')[0]} ", style=gate_style)
+            gate_cell.append(f"{bar} ", style="cyan")
+            gate_cell.append(f"{e['gate_n']}/{e['gate_target']}", style="bold")
+        else:
+            gate_cell = Text(e["gate"],
+                             style=("green" if e["mode"] == "shadow" else "dim"))
 
-        # Highlight gate cell for T6 if early-kill or dead
-        if eid == "T6" and ("KILL" in e["gate"] or "DEAD" in e["gate"]):
-            _safe_addstr(stdscr, row, 50, f"{e['gate']:<24}",
-                         curses.color_pair(C_RED) | curses.A_BOLD)
-        elif eid == "T3a" and "PAUSED" in e["gate"]:
-            _safe_addstr(stdscr, row, 50, f"{e['gate']:<24}",
-                         curses.color_pair(C_YELLOW))
-        row += 1
+        wl_text = Text()
+        wl_text.append(f"{e['wins']}", style="bright_green")
+        wl_text.append("/", style="dim")
+        wl_text.append(f"{e['losses']}", style="bright_red")
 
-    # ── ALERTS ──────────────────────────────────────────────────────
-    row += 1
-    _safe_addstr(stdscr, row, 0, "─" * (w - 1), curses.color_pair(C_DIM))
-    row += 1
-    _safe_addstr(stdscr, row, 0, " ALERTS",
-                 curses.A_BOLD | curses.color_pair(C_CYAN))
-    row += 1
+        table.add_row(
+            Text(eid, style="bold bright_white"),
+            Text(e["mode"]),
+            _pnl_text(e["realized"], 13),
+            wl_text,
+            Text(str(e["open"]), style="bold yellow" if e["open"] > 0 else "dim"),
+            Text(e["last_fire"], style="dim"),
+            gate_cell,
+        )
+    return Panel(table, title="[bold cyan]Engines[/]", border_style="cyan", padding=(0, 1))
 
+
+def _build_alerts_panel(state, Panel, Text):
     alerts = state["alerts"]
     if not alerts:
-        _safe_addstr(stdscr, row, 1, "✓ NO ALERTS",
-                     curses.color_pair(C_GREEN) | curses.A_BOLD)
-        row += 1
-    else:
-        for sev, msg in alerts:
-            if row >= h - 2:
-                _safe_addstr(stdscr, row, 1,
-                             f"… {len(alerts) - (row - (h-2-len(alerts)))} more (truncated)",
-                             curses.color_pair(C_DIM))
-                row += 1
-                break
-            attr = curses.color_pair(C_RED) if sev == "red" else curses.color_pair(C_YELLOW)
-            _safe_addstr(stdscr, row, 1, f"⚠ {msg}", attr)
-            row += 1
-
-    # ── FOOTER (always last line) ───────────────────────────────────
-    foot_row = h - 1
-    foot = (f" refreshed {state['now_utc'].strftime('%H:%M:%S')} UTC   "
-            f"next in {next_in:>2}s   Ctrl+C to exit")
-    _safe_addstr(stdscr, foot_row, 0, " " * (w - 1),
-                 curses.A_REVERSE | curses.color_pair(C_DIM))
-    _safe_addstr(stdscr, foot_row, 0, foot,
-                 curses.A_REVERSE | curses.color_pair(C_DIM))
-
-    stdscr.refresh()
+        body = Text("✓ All systems nominal", style="bold bright_green")
+        return Panel(body, title="[bold cyan]Alerts[/]", border_style="bright_green",
+                     padding=(0, 1))
+    body = Text()
+    for i, (sev, msg) in enumerate(alerts):
+        style = "bold bright_red" if sev == "red" else "bold yellow"
+        body.append("⚠ ", style=style)
+        body.append(msg, style=style)
+        if i < len(alerts) - 1:
+            body.append("\n")
+    border = "bright_red" if any(s == "red" for s, _ in alerts) else "yellow"
+    return Panel(body, title=f"[bold cyan]Alerts ({len(alerts)})[/]",
+                 border_style=border, padding=(0, 1))
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Plain (no-curses) fallback render — for ssh/CI/log-pipe contexts
-# ─────────────────────────────────────────────────────────────────────
+def _build_footer(state, refresh_sec, next_in_sec, Panel, Text):
+    now_s = state["now_utc"].strftime("%H:%M:%S UTC")
+    body = Text(no_wrap=True)
+    body.append(" refreshed ", style="dim")
+    body.append(now_s, style="bold")
+    body.append("   next refresh in ", style="dim")
+    body.append(f"{next_in_sec:>2}s", style="bold cyan")
+    body.append("   ", style="dim")
+    body.append("q or Ctrl+C to exit", style="dim italic")
+    return Panel(body, border_style="dim", padding=(0, 1))
 
-def render_plain(state: dict, refresh_sec: int) -> str:
-    """ANSI-color plain text render, used when curses is unavailable
-    (e.g., output is a pipe). Same layout, but printed each tick instead
-    of in-place redraw."""
-    ESC = "\x1b["
-    GREEN, RED, YELLOW, CYAN, BOLD, DIM, RESET = (
-        f"{ESC}32m", f"{ESC}31m", f"{ESC}33m", f"{ESC}36m",
-        f"{ESC}1m", f"{ESC}2m", f"{ESC}0m",
+
+def build_layout(state, refresh_sec, next_in_sec):
+    Console, Layout, Live, Panel, Table, Text, Align = _import_rich()
+    layout = Layout()
+    layout.split_column(
+        Layout(_build_header_panel(state, Panel, Text, Align), name="header", size=3),
+        Layout(_build_engine_table(state, Panel, Table, Text), name="engines", size=7),
+        Layout(_build_alerts_panel(state, Panel, Text), name="alerts"),
+        Layout(_build_footer(state, refresh_sec, next_in_sec, Panel, Text),
+               name="footer", size=3),
     )
-    cap = state["macro_cap_pct"]
-    credits = state["odds_api_credits"]
-    realized = state["portfolio_realized"]
-    pnl_col = GREEN if realized > 0 else (RED if realized < 0 else "")
-    out = []
-    out.append(f"{BOLD}{CYAN}PORTFOLIO{RESET}  "
-               f"realized={pnl_col}${realized:+.2f}{RESET}  "
-               f"macro={(f'{cap:.1f}%' if cap else '?')}  "
-               f"odds={credits if credits is not None else '?'}  "
-               f"{state['now_utc'].strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    out.append(f"{DIM}{'─'*78}{RESET}")
-    out.append(f"{BOLD}{CYAN} ENG  mode      clean_real    W/L      open  last_fire   gate{RESET}")
-    for eid in ACTIVE_ENGINE_ORDER:
-        e = state["per_engine"][eid]
-        pnl_c = GREEN if e["realized"] > 0 else (RED if e["realized"] < 0 else "")
-        gate_c = YELLOW if "PAUSED" in e["gate"] else (
-            RED if ("KILL" in e["gate"] or "DEAD" in e["gate"]) else "")
-        out.append(
-            f" {eid:<4} {e['mode']:<8}  {pnl_c}${e['realized']:>+10.2f}{RESET}  "
-            f"{e['wins']:>2}/{e['losses']:>2}    {e['open']:>4}  "
-            f"{e['last_fire']:<10}  {gate_c}{e['gate']:<24}{RESET}"
-        )
-    out.append(f"{DIM}{'─'*78}{RESET}")
-    out.append(f"{BOLD}{CYAN} ALERTS{RESET}")
-    if not state["alerts"]:
-        out.append(f"  {GREEN}{BOLD}✓ NO ALERTS{RESET}")
-    else:
-        for sev, msg in state["alerts"]:
-            col = RED if sev == "red" else YELLOW
-            out.append(f"  {col}⚠ {msg}{RESET}")
-    out.append(f"{DIM} refreshed {state['now_utc'].strftime('%H:%M:%S')} UTC   "
-               f"next in {refresh_sec}s   Ctrl+C to exit{RESET}")
-    return "\n".join(out)
+    return layout
 
 
 # ─────────────────────────────────────────────────────────────────────
 # Main loop
 # ─────────────────────────────────────────────────────────────────────
 
-def _curses_main(stdscr, refresh_sec: int) -> None:
-    curses.curs_set(0)
-    _init_colors()
-    stdscr.nodelay(True)
-    stdscr.timeout(1000)  # getch returns -1 after 1s
-
-    state = gather_state()
-    tick_end = time.time() + refresh_sec
-    while True:
-        remaining = max(0, int(tick_end - time.time()))
-        render(stdscr, state, refresh_sec, remaining)
-        c = stdscr.getch()
-        if c == ord('q') or c == 27:  # q or ESC
-            break
-        if time.time() >= tick_end:
-            state = gather_state()
-            tick_end = time.time() + refresh_sec
-
-
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--refresh-sec", type=int, default=30)
     ap.add_argument("--once", action="store_true",
-                    help="dump state as JSON and exit (smoke-test / headless)")
-    ap.add_argument("--plain", action="store_true",
-                    help="no-curses ANSI fallback (for ssh / non-tty)")
+                    help="dump state as JSON and exit (smoke test, no rich)")
     args = ap.parse_args()
 
     if args.once:
         state = gather_state()
-        # JSON-serializable copy
         s = dict(state)
         s["now_utc"] = state["now_utc"].isoformat()
         s["alerts"] = [{"severity": sev, "message": msg} for sev, msg in state["alerts"]]
         print(json.dumps(s, indent=2, default=str))
         return 0
 
-    if args.plain or not sys.stdout.isatty():
-        try:
-            while True:
-                state = gather_state()
-                sys.stdout.write("\x1b[2J\x1b[H")  # clear+home
-                sys.stdout.write(render_plain(state, args.refresh_sec) + "\n")
-                sys.stdout.flush()
-                time.sleep(args.refresh_sec)
-        except KeyboardInterrupt:
-            print()
-            return 0
+    try:
+        Console, Layout, Live, Panel, Table, Text, Align = _import_rich()
+    except ImportError:
+        print("ERROR: rich library not installed.")
+        print("Install: pip install rich --break-system-packages")
+        return 1
+
+    console = Console()
+    state = gather_state()
+    tick_end = time.time() + args.refresh_sec
 
     try:
-        curses.wrapper(_curses_main, args.refresh_sec)
+        with Live(build_layout(state, args.refresh_sec, args.refresh_sec),
+                  console=console, screen=True, refresh_per_second=2,
+                  auto_refresh=False) as live:
+            while True:
+                next_in = max(0, int(tick_end - time.time()))
+                live.update(build_layout(state, args.refresh_sec, next_in),
+                            refresh=True)
+                time.sleep(0.5)
+                if time.time() >= tick_end:
+                    state = gather_state()
+                    tick_end = time.time() + args.refresh_sec
     except KeyboardInterrupt:
         pass
     return 0

@@ -62,36 +62,31 @@ class Check:
 # Add new rows when a new daemon ships. Remove rows when a daemon retires.
 # ---------------------------------------------------------------------------
 CHECKS: List[Check] = [
-    # T1 — weather ensemble
-    Check("T1", "NWS actuals (any station)", DOCS / "terminal1_data" / "nws_actuals_NYC.jsonl", 12.0),
-    Check("T1", "paper trader log",          DOCS / "terminal1_phase2_paper_trader.log",        0.5),
-    Check("T1", "model pullers log",         DOCS / "terminal1_pullers.log",                    1.0),
-    Check("T1", "kalshi logger",             DOCS / "terminal1_logger.log",                     0.5),
-    Check("T1", "reconciler",                DOCS / "terminal1_settlement_reconciler.log",      2.0),
+    # SESSION 7 (2026-05-16) CLEAN-OUT
+    # ──────────────────────────────────────────────────────────────────
+    # Removed: T1, T2, T3b, T3c sections. All four engines archived in
+    # sessions 6–7. Their logger files will never update again — keeping
+    # them here was firing the freshness alarm constantly, which in turn
+    # forced T6 into dry-run via the trader-side flag check. ALARM ON
+    # AN ARCHIVED ENGINE IS NOT A SIGNAL, IT'S NOISE.
+    # Added: T7 (active 2026-05-10 — Game 1-2 NBA/NHL playoffs).
+    # If an engine returns from the dead, restore its block here.
 
-    # T2 — catalyst book
-    Check("T2", "reconciler",                DOCS / "terminal2_data" / "settlement_reconciler.log", 1.0),
-    Check("T2", "mark drift (daily)",        DOCS / "terminal2_data" / "mark_drift.log",         30.0),
+    # T6 — MLB game markets (WebSocket logger writes snapshots every 5 sec;
+    # 6-min threshold gives buffer for transient reconnects).
+    Check("T6", "kalshi logger (WS)",     DOCS / "terminal6_data" / "ws_logger.log",         0.1),
+    Check("T6", "Vegas lines puller",     DOCS / "terminal6_data" / "lines_puller.log",      1.5, missing_ok=True),
+    Check("T6", "paper trader",           DOCS / "terminal6_data" / "paper_trader.log",      1.0, missing_ok=True),
+    Check("T6", "settlement reconciler",  DOCS / "terminal6_data" / "settlement_reconciler.log", 2.0, missing_ok=True),
 
-    # T3b — CPI nowcast
-    Check("T3b", "kalshi logger",            DOCS / "terminal3b_data" / "kalshi_logger.log",     0.5),
-    Check("T3b", "paper trader",             DOCS / "terminal3b_data" / "paper_trader.log",      1.0),
-    Check("T3b", "nowcast puller",           DOCS / "terminal3b_data" / "nowcast_puller.log",    8.0),
-    Check("T3b", "BLS actuals",              DOCS / "terminal3b_data" / "bls_actuals.log",       30.0),
-    Check("T3b", "reconciler (hourly)",      DOCS / "terminal3b_data" / "settlement_reconciler.log", 2.0),
-
-    # T3c — initial jobless claims
-    Check("T3c", "kalshi logger",            DOCS / "terminal3c_data" / "kalshi_logger.log",     0.5),
-    Check("T3c", "paper trader",             DOCS / "terminal3c_data" / "paper_trader.log",      1.0),
-    Check("T3c", "FRED claims data",         DOCS / "terminal3c_data" / "claims_data.log",       14.0),
-
-    # T6 — MLB game markets (cut over to WebSocket 2026-05-08; REST logger
-    # retired). The WS logger writes snapshots every 5 sec; threshold of 6 min
-    # gives a generous buffer for transient reconnects.
-    Check("T6", "kalshi logger (WS)",        DOCS / "terminal6_data" / "ws_logger.log",          0.1),
-    Check("T6", "Vegas lines puller",        DOCS / "terminal6_data" / "lines_puller.log",       1.5,  missing_ok=True),
-    Check("T6", "paper trader",              DOCS / "terminal6_data" / "paper_trader.log",       1.0,  missing_ok=True),
-    Check("T6", "settlement reconciler",     DOCS / "terminal6_data" / "settlement_reconciler.log", 2.0, missing_ok=True),
+    # T7 — NBA/NHL playoffs Game 1-2 (WebSocket logger same cadence as T6).
+    # Game density is sparse (~12 G1/G2 total through Finals) so the lines
+    # puller and reconciler may not run for days at a stretch — marked
+    # missing_ok to avoid screaming on quiet days.
+    Check("T7", "kalshi logger (WS)",     DOCS / "terminal7_data" / "ws_logger.log",         0.1),
+    Check("T7", "lines puller",           DOCS / "terminal7_data" / "lines_puller.log",      6.0, missing_ok=True),
+    Check("T7", "paper trader",           DOCS / "terminal7_data" / "paper_trader.log",      6.0, missing_ok=True),
+    Check("T7", "settlement reconciler",  DOCS / "terminal7_data" / "settlement_reconciler.log", 24.0, missing_ok=True),
 ]
 
 
