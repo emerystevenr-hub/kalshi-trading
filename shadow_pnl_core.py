@@ -82,6 +82,45 @@ def _read_engines() -> Dict[str, dict]:
     return json.loads(ENGINES_PATH.read_text())
 
 
+def load_engine_bankroll(engine_id: str) -> float:
+    """Return bankroll_usd for the given engine, read from engines.json.
+
+    Single source of truth: every paper trader MUST resolve its starting
+    bankroll through this function at startup, never via a hardcoded
+    constant. To change an engine's bankroll, edit engines.json and
+    restart the daemon — no code edit required.
+
+    Fails loud (raises) if:
+      - engines.json is missing or unparseable
+      - engine_id is not present in the registry
+      - the engine is active=false (archived — trader shouldn't be running)
+      - bankroll_usd is missing, non-numeric, or <= 0
+
+    The fail-loud behaviour is deliberate: silent fallback to a default
+    bankroll would cause Kelly sizing on the wrong base. Better to refuse
+    to start than to start sized incorrectly.
+    """
+    engines = _read_engines()
+    meta = engines.get(engine_id)
+    if not isinstance(meta, dict):
+        raise KeyError(
+            f"engine_id={engine_id!r} not found in {ENGINES_PATH}. "
+            f"Known engines: {sorted(engines.keys())}"
+        )
+    if not meta.get("active"):
+        raise RuntimeError(
+            f"engine_id={engine_id!r} is active=false in engines.json (archived). "
+            f"Refusing to start trader for an archived engine."
+        )
+    bankroll = meta.get("bankroll_usd")
+    if not isinstance(bankroll, (int, float)) or bankroll <= 0:
+        raise RuntimeError(
+            f"engine_id={engine_id!r} has invalid bankroll_usd={bankroll!r} "
+            f"in engines.json. Expected positive number."
+        )
+    return float(bankroll)
+
+
 def _append(row: dict) -> None:
     SHADOW_DIR.mkdir(parents=True, exist_ok=True)
     with open(LEDGER_PATH, "a") as f:

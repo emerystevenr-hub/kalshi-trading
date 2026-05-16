@@ -46,7 +46,7 @@ from zoneinfo import ZoneInfo
 # Allow imports from ~/Documents
 sys.path.insert(0, str(Path.home() / "Documents"))
 
-from shadow_pnl_core import ShadowLedger, _read_ledger  # noqa: E402
+from shadow_pnl_core import ShadowLedger, _read_ledger, load_engine_bankroll  # noqa: E402
 
 ENGINE = "T6"
 DATA_DIR = Path.home() / "Documents" / "terminal6_data"
@@ -59,10 +59,14 @@ MAX_CONTRACTS = 500           # ceiling — variance cap on a single position
 KELLY_FRACTION = 0.5          # half-Kelly (industry standard, lower variance vs full Kelly)
 MAX_BET_PCT_BANKROLL = 0.05   # never stake more than 5% of bankroll on a single bet
 MAX_TOTAL_EXPOSURE_PCT = 0.50 # never have more than 50% of bankroll tied up across all opens
-BANKROLL_USD_INITIAL = 12000  # T6 starting bankroll (engines.json T6.bankroll_usd).
-                              # Bankroll history (2026-05-09): $5K → $10K (T2 archive absorb)
-                              # → $12K (+$2K from T1 sub-bucket capital recycle). Kelly cap 5%
-                              # unchanged. Max single position $600. Total exposure cap $6K (50%).
+BANKROLL_USD_INITIAL = load_engine_bankroll(ENGINE)
+                              # T6 starting bankroll — read at import time from engines.json
+                              # via shadow_pnl_core.load_engine_bankroll. engines.json is the
+                              # single source of truth; to change bankroll, edit it there and
+                              # restart this daemon. No code edit required.
+                              # Bankroll history: $5K → $10K (T2 archive absorb 2026-05-09)
+                              # → $12K (T1 sub-bucket recycle) → $13K → $18K (session-7 T3b+T3c
+                              # absorption, 2026-05-16). Kelly cap 5% unchanged.
                               # Live bankroll = INITIAL + realized P&L; recomputed each cycle.
 # Kalshi fee model — taker rate × p × (1-p) per contract on entry.
 # Settlement is fee-free; we hold positions to settle so we pay one-sided fee only.

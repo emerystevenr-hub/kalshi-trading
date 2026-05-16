@@ -64,7 +64,7 @@ from typing import Dict, List, Optional, Tuple
 # Allow imports from ~/Documents
 sys.path.insert(0, str(Path.home() / "Documents"))
 
-from shadow_pnl_core import ShadowLedger, _read_ledger  # noqa: E402
+from shadow_pnl_core import ShadowLedger, _read_ledger, load_engine_bankroll  # noqa: E402
 
 ENGINE = "T7"
 DATA_DIR = Path.home() / "Documents" / "terminal7_data"
@@ -77,7 +77,11 @@ MAX_CONTRACTS = 200           # ceiling — scaled from T6's 500 to T7's $2K ban
 KELLY_FRACTION = 0.5          # half-Kelly
 MAX_BET_PCT_BANKROLL = 0.05   # 5% per-position cap
 MAX_TOTAL_EXPOSURE_PCT = 0.50 # 50% total exposure cap
-BANKROLL_USD_INITIAL = 2000   # T7 reserve from T1 sub-bucket recycle.
+BANKROLL_USD_INITIAL = load_engine_bankroll(ENGINE)
+                              # T7 bankroll — read at import time from engines.json via
+                              # shadow_pnl_core.load_engine_bankroll. engines.json is the
+                              # single source of truth; edit there + restart daemon to change.
+                              # Origin: $2K reserve from T1 sub-bucket capital recycle.
                               # Live bankroll = INITIAL + realized P&L.
 KALSHI_TAKER_FEE_RATE = 0.07
 MAX_DAILY_OPENS = 8           # scaled from T6's 15 — fewer games/day in playoffs
