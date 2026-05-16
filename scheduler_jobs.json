@@ -1,14 +1,14 @@
 {
-  "_doc": "Single source of truth for every periodic puller in the portfolio. Edit and SIGHUP the scheduler to reload (kill -HUP $(cat ~/Documents/scheduler.pid)). Per-job stdout/stderr lands in ~/Documents/scheduler_logs/<name>.log.",
-  "_session7_notes": "Session 7 (2026-05-16) FINAL sweep: removed t1_nws_actuals (T1 archived session 6), t2_daily_picks (T2 archived 2026-05-09), t3b_nowcast_puller + t3b_bls_actuals + t3c_claims_data (T3b + T3c archived session 7 — macro family pulled). Live T1 weather logger + T5 thesis factory + all T3b/T3c daemons + T3a fed_scanner must be killed on-host (see kill commands in session 7 handoff). Only T6 lines puller and entropy detector remain.",
+  "_doc": "Periodic puller registry. Edit and SIGHUP the scheduler to reload (kill -HUP $(cat ~/Documents/scheduler.pid)). Per-job stdout/stderr → ~/Documents/scheduler_logs/<name>.log. Jobs with an `engine` field are auto-skipped when that engine is set to active=false in shadow_pnl/engines.json (single source of truth, session 7 v6).",
   "jobs": [
     {
       "name": "t6_mlb_lines_puller",
+      "engine": "T6",
       "command": "/opt/homebrew/bin/python3 ~/Documents/terminal6_mlb_lines_puller.py --once",
       "interval_sec": 5400,
       "timeout_sec": 120,
       "enabled": true,
-      "_notes": "T6 sharp Vegas line pull. 90-min cadence. Bankroll $18K (T3b + T3c archive absorption); Kelly cap 5% per bet → max $900 single position; 50% exposure cap → $9K."
+      "_notes": "T6 sharp Vegas line pull. 90-min cadence. Bankroll $18K → Kelly cap 5% = max $900 single. Auto-disabled if T6 flips to active=false."
     },
     {
       "name": "entropy_collapse_detector",
@@ -16,7 +16,7 @@
       "interval_sec": 300,
       "timeout_sec": 60,
       "enabled": true,
-      "_notes": "Cross-engine informed-flow detector. Reads kalshi snapshot files. After session 7 macro-family archive, the only consumers are T6/T7 — but the detector keeps running because Phase 2 directional entry (after n>=15 calibrated alerts) may still arrive. If it generates noise for archived engines, scope it down to T6/T7 then."
+      "_notes": "Cross-engine informed-flow detector. No `engine` field — runs regardless of any single engine's state. After session 7 archive sweep, the only consumers left are T6/T7; if it generates noise for archived engines, scope it down then."
     }
   ]
 }

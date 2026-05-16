@@ -47,6 +47,7 @@ from typing import Dict, List, Optional
 
 DOCS = Path.home() / "Documents"
 JOBS_FILE = DOCS / "scheduler_jobs.json"
+ENGINES_FILE = DOCS / "shadow_pnl" / "engines.json"
 STATE_FILE = DOCS / "scheduler_state.json"
 STATUS_FILE = DOCS / "scheduler_status.json"
 LOG_DIR = DOCS / "scheduler_logs"
@@ -69,6 +70,25 @@ def slog(msg: str) -> None:
     print(f"[{now_utc()}] [scheduler] {msg}", flush=True)
 
 
+def _active_engine_ids() -> set:
+    """Read engines.json and return the set of engine IDs that are active.
+    Session 7 v6: scheduler skips any job whose `engine` field references an
+    archived engine, so flipping `active: false` in engines.json silences ALL
+    jobs for that engine without editing scheduler_jobs.json. Single source
+    of truth for engine state lives in engines.json."""
+    if not ENGINES_FILE.exists():
+        return set()
+    try:
+        engines = json.loads(ENGINES_FILE.read_text())
+    except json.JSONDecodeError as e:
+        slog(f"WARN: engines.json unreadable ({e}) — running jobs without engine filter")
+        return set()
+    return {
+        eid for eid, meta in engines.items()
+        if isinstance(meta, dict) and meta.get("active")
+    }
+
+
 def load_jobs() -> List[dict]:
     if not JOBS_FILE.exists():
         slog(f"WARN: {JOBS_FILE} missing — no jobs configured")
@@ -79,12 +99,20 @@ def load_jobs() -> List[dict]:
         slog(f"ERROR: jobs config invalid JSON: {e}")
         return []
     jobs = data.get("jobs", [])
+    active_engines = _active_engine_ids()
     valid = []
     for j in jobs:
         if not all(k in j for k in ("name", "command", "interval_sec")):
             slog(f"WARN: job {j!r} missing required keys — skipping")
             continue
         if not j.get("enabled", True):
+            continue
+        # Engine-aware filter: if the job declares an `engine` and that engine
+        # is not active in engines.json, skip it. Jobs without an `engine`
+        # field (cross-cutting infra like entropy_collapse_detector) always run.
+        engine = j.get("engine")
+        if engine and engine not in active_engines:
+            slog(f"skip {j['name']} (engine {engine} archived in engines.json)")
             continue
         valid.append(j)
     return valid
