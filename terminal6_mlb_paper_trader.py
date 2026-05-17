@@ -74,6 +74,11 @@ BANKROLL_USD_INITIAL = load_engine_bankroll(ENGINE)
 KALSHI_TAKER_FEE_RATE = 0.07
 MAX_DAILY_OPENS = 15
 MAX_TOTAL_OPENS = 30
+MDD_GATE_PCT = 0.08           # Max drawdown circuit breaker: block new opens
+                              # when (peak - current) / peak > MDD_GATE_PCT.
+                              # Peak tracked in terminal6_data/mdd_state.json,
+                              # auto-resets when bankroll recovers above prior
+                              # peak. Manual reset: delete the state file.
 MIN_KALSHI_P = 0.20
 MAX_KALSHI_P = 0.80
 MAX_SPREAD_CENTS = 5
@@ -675,6 +680,68 @@ def count_today_t6_opens() -> int:
     return n
 
 
+MDD_STATE_PATH = DATA_DIR / "mdd_state.json"
+MDD_FLAG = Path.home() / "Documents" / "mdd_alarm.flag"
+
+
+def _check_mdd_gate(bankroll: float) -> Tuple[bool, float, float]:
+    """Track running peak bankroll, return (blocked, drawdown_pct, peak).
+
+    Initializes peak as max(engines.json bankroll, current live bankroll) if
+    no state file exists — first init can't reconstruct prior peaks but we at
+    least don't underweight current. Updates peak whenever bankroll exceeds
+    prior peak. Writes mdd_alarm.flag when drawdown > MDD_GATE_PCT; removes
+    the flag once bankroll recovers above peak (auto-reset)."""
+    state_existed_and_valid = False
+    if MDD_STATE_PATH.exists():
+        try:
+            state = json.loads(MDD_STATE_PATH.read_text())
+            peak = float(state.get("peak_bankroll_usd", BANKROLL_USD_INITIAL))
+            state_existed_and_valid = True
+        except (OSError, ValueError, json.JSONDecodeError):
+            peak = max(BANKROLL_USD_INITIAL, bankroll)
+    else:
+        peak = max(BANKROLL_USD_INITIAL, bankroll)
+
+    new_high = bankroll > peak
+    if new_high:
+        peak = bankroll
+
+    # Persist state if (a) we just hit a new high, (b) state file didn't
+    # exist yet, or (c) state file was corrupt and we recomputed peak.
+    # Without this, a cold start with no state file fails to persist and
+    # the gate never fires — peak is recomputed from scratch each call.
+    if new_high or not state_existed_and_valid:
+        try:
+            MDD_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            MDD_STATE_PATH.write_text(json.dumps({
+                "peak_bankroll_usd": peak,
+                "peak_ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }, indent=2))
+        except OSError:
+            pass
+
+    drawdown_pct = (peak - bankroll) / peak if peak > 0 else 0.0
+    blocked = drawdown_pct > MDD_GATE_PCT
+
+    if blocked:
+        try:
+            MDD_FLAG.write_text(
+                f"MDD gate tripped {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n"
+                f"peak=${peak:.2f} current=${bankroll:.2f} "
+                f"drawdown={drawdown_pct*100:.2f}% threshold={MDD_GATE_PCT*100:.0f}%\n"
+            )
+        except OSError:
+            pass
+    elif MDD_FLAG.exists():
+        try:
+            MDD_FLAG.unlink()
+        except OSError:
+            pass
+
+    return blocked, drawdown_pct, peak
+
+
 def trade_once(dry_run: bool) -> dict:
     # Freshness gate
     flag = Path.home() / "Documents" / "freshness_alarm.flag"
@@ -710,6 +777,12 @@ def trade_once(dry_run: bool) -> dict:
         return {"opened": 0, "rejected": 0}
     if n_today >= MAX_DAILY_OPENS:
         log(f"  [cap] daily opens {n_today} ≥ {MAX_DAILY_OPENS}, skipping")
+        return {"opened": 0, "rejected": 0}
+    mdd_blocked, mdd_pct, mdd_peak = _check_mdd_gate(bankroll)
+    if mdd_blocked:
+        log(f"  [mdd-gate] drawdown {mdd_pct*100:.2f}% exceeds "
+            f"{MDD_GATE_PCT*100:.0f}% threshold "
+            f"(peak=${mdd_peak:.2f}, current=${bankroll:.2f}) — blocking new opens")
         return {"opened": 0, "rejected": 0}
 
     sl = ShadowLedger() if not dry_run else None

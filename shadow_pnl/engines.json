@@ -79,6 +79,7 @@
     "monitoring": {
       "show_in_dashboard": true,
       "ws_logger_path": "terminal6_data/ws_logger.log",
+      "redeploy_script": "redeploy_t6_all.sh",
       "checks": [
         {"label": "kalshi logger (WS)",   "path": "terminal6_data/ws_logger.log",            "max_age_h": 0.1, "missing_ok": false},
         {"label": "Vegas lines puller",   "path": "terminal6_data/lines_puller.log",         "max_age_h": 1.5, "missing_ok": true},
@@ -98,6 +99,7 @@
     "monitoring": {
       "show_in_dashboard": true,
       "ws_logger_path": "terminal7_data/ws_logger.log",
+      "redeploy_script": "redeploy_t7_all.sh",
       "checks": [
         {"label": "kalshi logger (WS)",   "path": "terminal7_data/ws_logger.log",            "max_age_h": 0.1, "missing_ok": false},
         {"label": "lines puller",         "path": "terminal7_data/lines_puller.log",         "max_age_h": 6.0, "missing_ok": true},

@@ -17,6 +17,30 @@
       "timeout_sec": 60,
       "enabled": true,
       "_notes": "Cross-engine informed-flow detector. No `engine` field — runs regardless of any single engine's state. After session 7 archive sweep, the only consumers left are T6/T7; if it generates noise for archived engines, scope it down then."
+    },
+    {
+      "name": "daily_status_report",
+      "command": "/opt/homebrew/bin/python3 ~/Documents/daily_status_report.py --scheduled",
+      "interval_sec": 300,
+      "timeout_sec": 60,
+      "enabled": true,
+      "_notes": "Daily status email. Fires every 5 min but the script no-ops unless current PT time is in [08:00, 08:10) AND today's date is not already in the marker file (~/Documents/terminal6_data/daily_report_last_sent.txt). One email per morning. Requires ~/Documents/gmail_smtp.env (gitignored via *.env rule)."
+    },
+    {
+      "name": "daemon_watchdog",
+      "command": "/opt/homebrew/bin/python3 ~/Documents/daemon_watchdog.py --once",
+      "interval_sec": 300,
+      "timeout_sec": 90,
+      "enabled": true,
+      "_notes": "Auto-restart silent engine daemons. For each active engine in engines.json with both monitoring.ws_logger_path and monitoring.redeploy_script, checks ws_logger.log mtime vs per-engine threshold. Stale → bash the redeploy_script. Backoff: 3 restarts in 1h → stop restarting that engine and email an ALERT (throttled 1/h) until human runs `python3 daemon_watchdog.py --reset-state`. State at scheduler_logs/daemon_watchdog_state.json. Audit at scheduler_logs/daemon_watchdog_restarts.log."
+    },
+    {
+      "name": "portfolio_freshness_watchdog",
+      "command": "/opt/homebrew/bin/python3 ~/Documents/portfolio_freshness_watchdog.py --quiet",
+      "interval_sec": 300,
+      "timeout_sec": 60,
+      "enabled": true,
+      "_notes": "Passive freshness detector. For each active engine in engines.json, checks monitoring.checks[] files vs max_age_h thresholds. Raises ~/Documents/freshness_alarm.flag when stale — that flag forces paper_trader into dry-run on next cycle. Complementary to daemon_watchdog (active auto-restart): freshness_watchdog *protects* via dry-run, daemon_watchdog *recovers* via restart. Both run at 5-min cadence."
     }
   ]
 }

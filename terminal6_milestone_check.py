@@ -191,12 +191,20 @@ def load_t6_closed() -> List[dict]:
     return closes
 
 
+PF_HEALTHY_THRESHOLD = 1.5      # Profit Factor below this = unhealthy (diagnostic only)
+SHARPE_HEALTHY_THRESHOLD = 2.0  # Annualized Sharpe below this = unhealthy (diagnostic only)
+PF_SHARPE_FLAG_MIN_N = 50       # Don't flag PF/Sharpe until at least this many closes
+
+
 def compute_stats(closes: List[dict]) -> dict:
     n = len(closes)
     pnls = [c["realized_pnl_usd"] for c in closes]
     if n == 0:
         return {"n": 0, "mean": 0.0, "sd": 0.0, "lower_95": 0.0, "upper_95": 0.0,
-                "total_pnl": 0.0, "wins": 0, "losses": 0}
+                "total_pnl": 0.0, "wins": 0, "losses": 0,
+                "gross_profit": 0.0, "gross_loss": 0.0,
+                "profit_factor": None, "sharpe_per_trade": None,
+                "sharpe_annualized": None, "pf_sharpe_warning": None}
     mean = sum(pnls) / n
     sd = stdev(pnls) if n >= 2 else 0.0
     se = sd / math.sqrt(n) if n >= 2 else 0.0
@@ -204,6 +212,46 @@ def compute_stats(closes: List[dict]) -> dict:
     upper_95 = mean + 1.96 * se
     wins = sum(1 for p in pnls if p > 0)
     losses = sum(1 for p in pnls if p < 0)
+
+    # Profit Factor: gross profit / gross loss (both positive numbers).
+    # Undefined when there are no losses — return None rather than infinity
+    # so formatters render "n/a" instead of math noise.
+    gross_profit = sum(p for p in pnls if p > 0)
+    gross_loss = sum(-p for p in pnls if p < 0)  # positive magnitude
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
+
+    # Sharpe: per-trade = mean/sd; annualized by trade cadence (close_ts
+    # span / n trades = days_per_trade; annualization factor sqrt(252 /
+    # days_per_trade)). The standard SR > 2.0 benchmark is annualized.
+    sharpe_per_trade = (mean / sd) if sd > 0 else None
+    sharpe_annualized = None
+    if sharpe_per_trade is not None and n >= 2:
+        try:
+            close_ts = [datetime.fromisoformat(
+                (c.get("close_ts") or "").replace("Z", "+00:00")
+            ) for c in closes if c.get("close_ts")]
+            if len(close_ts) >= 2:
+                close_ts.sort()
+                span_days = (close_ts[-1] - close_ts[0]).total_seconds() / 86400.0
+                if span_days > 0:
+                    days_per_trade = span_days / max(1, n - 1)
+                    sharpe_annualized = sharpe_per_trade * math.sqrt(
+                        252.0 / max(0.1, days_per_trade)
+                    )
+        except (TypeError, ValueError):
+            sharpe_annualized = None
+
+    # Diagnostic flag (NOT a gate — no action taken on this signal yet).
+    pf_sharpe_warning = None
+    if n >= PF_SHARPE_FLAG_MIN_N:
+        warnings = []
+        if profit_factor is not None and profit_factor < PF_HEALTHY_THRESHOLD:
+            warnings.append(f"PF={profit_factor:.2f} below {PF_HEALTHY_THRESHOLD}")
+        if sharpe_annualized is not None and sharpe_annualized < SHARPE_HEALTHY_THRESHOLD:
+            warnings.append(f"Sharpe(ann)={sharpe_annualized:.2f} below {SHARPE_HEALTHY_THRESHOLD}")
+        if warnings:
+            pf_sharpe_warning = "; ".join(warnings)
+
     return {
         "n": n,
         "mean": mean,
@@ -213,6 +261,12 @@ def compute_stats(closes: List[dict]) -> dict:
         "total_pnl": sum(pnls),
         "wins": wins,
         "losses": losses,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        "profit_factor": profit_factor,
+        "sharpe_per_trade": sharpe_per_trade,
+        "sharpe_annualized": sharpe_annualized,
+        "pf_sharpe_warning": pf_sharpe_warning,
     }
 
 
@@ -342,6 +396,20 @@ def main() -> int:
     print(f"  mean per close: ${stats['mean']:+.4f}")
     print(f"  std dev       : ${stats['sd']:.4f}")
     print(f"  95% CI        : [${stats['lower_95']:+.4f}, ${stats['upper_95']:+.4f}]")
+    print(f"  gross profit  : ${stats['gross_profit']:+.2f}")
+    print(f"  gross loss    : ${stats['gross_loss']:.2f}")
+    pf = stats.get('profit_factor')
+    sa = stats.get('sharpe_annualized')
+    spt = stats.get('sharpe_per_trade')
+    print(f"  profit factor : {f'{pf:.3f}' if pf is not None else 'n/a (no losses)'}"
+          f"   (target ≥ {PF_HEALTHY_THRESHOLD})")
+    print(f"  sharpe (annual): {f'{sa:+.2f}' if sa is not None else 'n/a'}"
+          f"   (target ≥ {SHARPE_HEALTHY_THRESHOLD}; per-trade SR="
+          f"{f'{spt:+.4f}' if spt is not None else 'n/a'})")
+    if stats.get("pf_sharpe_warning"):
+        print(f"  PF/SHARPE FLAG: {stats['pf_sharpe_warning']}  (diagnostic only)")
+    elif stats['n'] < PF_SHARPE_FLAG_MIN_N:
+        print(f"  (PF/Sharpe flagging begins at n≥{PF_SHARPE_FLAG_MIN_N})")
     print()
     print(f"  GATE          : {gate['gate']}")
     print(f"  VERDICT       : {gate['verdict']}")

@@ -58,6 +58,7 @@ SCHED_STATUS = DOCS / "scheduler_status.json"
 SCHED_PID = DOCS / "scheduler.pid"
 FRESHNESS_FLAG = DOCS / "freshness_alarm.flag"
 MACRO_FLAG = DOCS / "macro_cap_alarm.flag"
+MDD_FLAG = DOCS / "mdd_alarm.flag"
 ENTROPY_ALERTS = DOCS / "entropy_alerts.jsonl"
 T6_LINES_LOG = DOCS / "scheduler_logs" / "t6_mlb_lines_puller.log"
 
@@ -166,8 +167,10 @@ def _engine_ledger_stats(ledger: List[dict], engine: str) -> Tuple[float, int, i
     return round(pnl, 2), wins, losses, open_count, last_event_ts
 
 
-def _t6_clean_stats(ledger: List[dict]) -> Tuple[float, int, int, int, dict, Optional[float]]:
-    """Returns (clean_total, wins, losses, open_count, gate_dict, last_event_ts)."""
+def _t6_clean_stats(ledger: List[dict]) -> Tuple[float, int, int, int, dict, Optional[float], dict]:
+    """Returns (clean_total, wins, losses, open_count, gate_dict, last_event_ts, full_stats).
+    full_stats is the entire compute_stats dict, which now includes profit_factor,
+    sharpe_annualized, gross_profit, gross_loss, pf_sharpe_warning."""
     all_closes = load_t6_closed()
     clean = [c for c in all_closes if not _is_contaminated(c)]
     stats = compute_stats(clean)
@@ -196,7 +199,7 @@ def _t6_clean_stats(ledger: List[dict]) -> Tuple[float, int, int, int, dict, Opt
             closed_pids.add(pid)
     open_count = sum(1 for pid in open_pids if pid not in closed_pids)
     return (round(stats["total_pnl"], 2), stats["wins"], stats["losses"],
-            open_count, gate, last_event_ts)
+            open_count, gate, last_event_ts, stats)
 
 
 def _total_deployed_capital(engines: dict) -> float:
@@ -307,6 +310,14 @@ def _alerts(state: dict) -> List[Tuple[str, str]]:
             msg = "macro cap breached"
         alerts.append(("red", f"MACRO CAP  {msg[:60]}"))
 
+    if MDD_FLAG.exists():
+        try:
+            lines = MDD_FLAG.read_text().strip().splitlines()
+            msg = lines[1] if len(lines) > 1 else lines[0]
+        except OSError:
+            msg = "max drawdown gate tripped — new opens blocked"
+        alerts.append(("red", f"MDD GATE  {msg[:64]}"))
+
     if FRESHNESS_FLAG.exists():
         try:
             lines = FRESHNESS_FLAG.read_text().strip().splitlines()
@@ -375,8 +386,9 @@ def gather_state() -> dict:
     portfolio_realized = 0.0
     for eid in active_order:
         meta = engines_meta.get(eid, {})
+        extra_stats: dict = {}
         if eid == T6_ENGINE_ID:
-            pnl, wins, losses, open_count, gate, last_ts = _t6_clean_stats(ledger)
+            pnl, wins, losses, open_count, gate, last_ts, extra_stats = _t6_clean_stats(ledger)
             gate_label = gate["gate"]
             gate_n, gate_target = wins + losses, VALIDATE_N
             gate_severity = (
@@ -412,6 +424,13 @@ def gather_state() -> dict:
             "gate_n":        gate_n,
             "gate_target":   gate_target,
             "gate_severity": gate_severity,
+            # Only populated for T6 today (full milestone stats); other engines
+            # show as None. Surfaces in the daily status email.
+            "profit_factor":     extra_stats.get("profit_factor"),
+            "sharpe_annualized": extra_stats.get("sharpe_annualized"),
+            "gross_profit":      extra_stats.get("gross_profit"),
+            "gross_loss":        extra_stats.get("gross_loss"),
+            "pf_sharpe_warning": extra_stats.get("pf_sharpe_warning"),
         }
         portfolio_realized += pnl
 
